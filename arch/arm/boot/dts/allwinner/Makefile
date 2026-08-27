@@ -281,7 +281,8 @@ sun8i-h3-orangepi-zero-plus2-interface-board-dtbs += \
 	sun8i-h3-orangepi-zero-plus2.dtb sun8i-orangepi-zero-interface-board.dtbo
 dtb-$(CONFIG_MACH_SUN9I) += \
 	sun9i-a80-optimus.dtb \
-	sun9i-a80-cubieboard4.dtb
+	sun9i-a80-cubieboard4.dtb \
+	sun9i-a80-tronsmart-draco.dtb
 dtb-$(CONFIG_MACH_SUNIV) += \
 	suniv-f1c100s-licheepi-nano.dtb \
 	suniv-f1c200s-lctech-pi.dtb \
