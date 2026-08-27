@@ -26,6 +26,7 @@ static const struct of_device_id allowlist[] __initconst = {
 	{ .compatible = "allwinner,sun8i-a23", },
 	{ .compatible = "allwinner,sun8i-a83t", },
 	{ .compatible = "allwinner,sun8i-h3", },
+	{ .compatible = "allwinner,sun9i-a80", },
 
 	{ .compatible = "apm,xgene-shadowcat", },
 
