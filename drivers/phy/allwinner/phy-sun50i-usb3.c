@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * Allwinner sun50i(H6) USB 3.0 phy driver
+ * Allwinner sun50i(H6) / sun9i(A80) USB 3.0 phy driver
  *
  * Copyright (C) 2017 Icenowy Zheng <icenowy@aosc.io>
  *
@@ -17,6 +17,7 @@
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
@@ -33,6 +34,13 @@
 
 /* PIPE Clock Control Register */
 #define SUNXI_PCC_PIPE_CLK_OPEN		(1 << 6)
+/*
+ * The A80 BSP clears these two bits before touching anything else in the PHY,
+ * and sets them again on shutdown, so they gate or power down the PIPE clock.
+ * The H6 BSP never writes them; they read back as zero there out of reset.
+ * The name is inferred from that usage - Allwinner documents neither SoC.
+ */
+#define SUNXI_PCC_PIPE_CLK_PWRDOWN	(3 << 0)
 
 /* PHY External Control Register */
 #define SUNXI_PEC_EXTERN_VBUS		(3 << 1)
@@ -51,16 +59,40 @@
 #define SUNXI_TXVBOOSTLVL(n)		((n) << 0)
 #define SUNXI_TXVBOOSTLVL_MASK		GENMASK(2, 0)
 
+/**
+ * struct sun50i_usb3_phy_cfg - per-SoC PHY tuning
+ * @phy_tune_low: value ORed into PHY_TUNE_LOW
+ * @phy_tune_low_mask: bits of PHY_TUNE_LOW cleared before that OR
+ * @txvboostlvl: TXVBOOSTLVL field of PHY_TUNE_HIGH
+ * @pipe_clk_pwrdown: PIPE clock needs taking out of power down (A80 only)
+ *
+ * None of these registers are documented; every value here is what the
+ * matching Allwinner BSP driver writes.
+ */
+struct sun50i_usb3_phy_cfg {
+	u32 phy_tune_low;
+	u32 phy_tune_low_mask;
+	u8 txvboostlvl;
+	bool pipe_clk_pwrdown;
+};
+
 struct sun50i_usb3_phy {
 	struct phy *phy;
 	void __iomem *regs;
 	struct reset_control *reset;
 	struct clk *clk;
+	const struct sun50i_usb3_phy_cfg *cfg;
 };
 
 static void sun50i_usb3_phy_open(struct sun50i_usb3_phy *phy)
 {
 	u32 val;
+
+	if (phy->cfg->pipe_clk_pwrdown) {
+		val = readl(phy->regs + SUNXI_PIPE_CLOCK_CONTROL);
+		val &= ~SUNXI_PCC_PIPE_CLK_PWRDOWN;
+		writel(val, phy->regs + SUNXI_PIPE_CLOCK_CONTROL);
+	}
 
 	val = readl(phy->regs + SUNXI_PHY_EXTERNAL_CONTROL);
 	val |= SUNXI_PEC_EXTERN_VBUS;
@@ -76,22 +108,58 @@ static void sun50i_usb3_phy_open(struct sun50i_usb3_phy *phy)
 	writel(val, phy->regs + SUNXI_ISCR);
 
 	/*
-	 * All the magic numbers written to the PHY_TUNE_{LOW_HIGH}
+	 * All the magic numbers written to the PHY_TUNE_{LOW,HIGH}
 	 * registers are directly taken from the BSP USB3 driver from
 	 * Allwiner.
 	 */
-	writel(0x0047fc87, phy->regs + SUNXI_PHY_TUNE_LOW);
+	val = readl(phy->regs + SUNXI_PHY_TUNE_LOW);
+	val &= ~phy->cfg->phy_tune_low_mask;
+	val |= phy->cfg->phy_tune_low;
+	writel(val, phy->regs + SUNXI_PHY_TUNE_LOW);
 
 	val = readl(phy->regs + SUNXI_PHY_TUNE_HIGH);
 	val &= ~(SUNXI_TXVBOOSTLVL_MASK | SUNXI_LOS_BIAS_MASK |
 		 SUNXI_TX_SWING_FULL_MASK | SUNXI_TX_DEEMPH_6GB_MASK |
 		 SUNXI_TX_DEEMPH_3P5DB_MASK);
-	val |= SUNXI_TXVBOOSTLVL(0x7);
+	val |= SUNXI_TXVBOOSTLVL(phy->cfg->txvboostlvl);
 	val |= SUNXI_LOS_BIAS(0x7);
 	val |= SUNXI_TX_SWING_FULL(0x55);
 	val |= SUNXI_TX_DEEMPH_6DB(0x20);
 	val |= SUNXI_TX_DEEMPH_3P5DB(0x15);
 	writel(val, phy->regs + SUNXI_PHY_TUNE_HIGH);
+}
+
+static void sun50i_usb3_phy_close(struct sun50i_usb3_phy *phy)
+{
+	u32 val;
+
+	/*
+	 * Only the A80 BSP has a shutdown path; on the H6 the reset and the
+	 * clock gate are the whole of it.
+	 */
+	if (!phy->cfg->pipe_clk_pwrdown)
+		return;
+
+	val = readl(phy->regs + SUNXI_PHY_EXTERNAL_CONTROL);
+	val &= ~(SUNXI_PEC_EXTERN_VBUS | SUNXI_PEC_SSC_EN |
+		 SUNXI_PEC_REF_SSP_EN);
+	writel(val, phy->regs + SUNXI_PHY_EXTERNAL_CONTROL);
+
+	val = readl(phy->regs + SUNXI_PIPE_CLOCK_CONTROL);
+	val &= ~SUNXI_PCC_PIPE_CLK_OPEN;
+	writel(val, phy->regs + SUNXI_PIPE_CLOCK_CONTROL);
+
+	val = readl(phy->regs + SUNXI_ISCR);
+	val &= ~SUNXI_ISCR_FORCE_VBUS;
+	writel(val, phy->regs + SUNXI_ISCR);
+
+	val = readl(phy->regs + SUNXI_PHY_TUNE_HIGH);
+	val &= GENMASK(31, 25);
+	writel(val, phy->regs + SUNXI_PHY_TUNE_HIGH);
+
+	val = readl(phy->regs + SUNXI_PIPE_CLOCK_CONTROL);
+	val |= SUNXI_PCC_PIPE_CLK_PWRDOWN;
+	writel(val, phy->regs + SUNXI_PIPE_CLOCK_CONTROL);
 }
 
 static int sun50i_usb3_phy_init(struct phy *_phy)
@@ -117,6 +185,7 @@ static int sun50i_usb3_phy_exit(struct phy *_phy)
 {
 	struct sun50i_usb3_phy *phy = phy_get_drvdata(_phy);
 
+	sun50i_usb3_phy_close(phy);
 	reset_control_assert(phy->reset);
 	clk_disable_unprepare(phy->clk);
 
@@ -138,6 +207,10 @@ static int sun50i_usb3_phy_probe(struct platform_device *pdev)
 	phy = devm_kzalloc(dev, sizeof(*phy), GFP_KERNEL);
 	if (!phy)
 		return -ENOMEM;
+
+	phy->cfg = of_device_get_match_data(dev);
+	if (!phy->cfg)
+		return -EINVAL;
 
 	phy->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(phy->clk)) {
@@ -168,8 +241,28 @@ static int sun50i_usb3_phy_probe(struct platform_device *pdev)
 	return PTR_ERR_OR_ZERO(phy_provider);
 }
 
+static const struct sun50i_usb3_phy_cfg sun50i_h6_usb3_phy_cfg = {
+	.phy_tune_low		= 0x0047fc87,
+	.phy_tune_low_mask	= GENMASK(31, 0),
+	.txvboostlvl		= 0x7,
+};
+
+static const struct sun50i_usb3_phy_cfg sun9i_a80_usb3_phy_cfg = {
+	.phy_tune_low		= 0x03c7fc83,
+	.phy_tune_low_mask	= 0x03fe0fff,
+	.txvboostlvl		= 0x0,
+	.pipe_clk_pwrdown	= true,
+};
+
 static const struct of_device_id sun50i_usb3_phy_of_match[] = {
-	{ .compatible = "allwinner,sun50i-h6-usb3-phy" },
+	{
+		.compatible = "allwinner,sun50i-h6-usb3-phy",
+		.data = &sun50i_h6_usb3_phy_cfg,
+	},
+	{
+		.compatible = "allwinner,sun9i-a80-usb3-phy",
+		.data = &sun9i_a80_usb3_phy_cfg,
+	},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, sun50i_usb3_phy_of_match);
@@ -183,6 +276,6 @@ static struct platform_driver sun50i_usb3_phy_driver = {
 };
 module_platform_driver(sun50i_usb3_phy_driver);
 
-MODULE_DESCRIPTION("Allwinner H6 USB 3.0 phy driver");
+MODULE_DESCRIPTION("Allwinner H6/A80 USB 3.0 phy driver");
 MODULE_AUTHOR("Icenowy Zheng <icenowy@aosc.io>");
 MODULE_LICENSE("GPL");
