@@ -8028,6 +8028,44 @@ static int __stmmac_dvr_probe(struct device *device,
 	if (!pm_runtime_enabled(device))
 		pm_runtime_enable(device);
 
+	/*
+	 * On a cold power-on this board's RTL8211E is not yet answering when
+	 * stmmac would normally scan: the PHY's supplies only come up when the
+	 * AXP binds, ~180 ms before probe reaches here, and phylib's scan is a
+	 * one-shot - miss it and eth0 comes up with no PHY at all.
+	 *
+	 * Poll PHYSID1 directly (dwmac1000 MII_ADDR/MII_DATA) until the PHY
+	 * answers, so warm boots cost nothing and cold boots wait only as long
+	 * as they must.
+	 */
+	{
+		unsigned int waited = 0;
+		u32 val = 0;
+		int busy;
+
+		while (waited < 3000) {
+			writel(0x00000091, priv->ioaddr + 0x10);
+			for (busy = 0; busy < 10000; busy++) {
+				if (!(readl(priv->ioaddr + 0x10) & 1))
+					break;
+				udelay(1);
+			}
+			val = readl(priv->ioaddr + 0x14) & 0xffff;
+			if (val && val != 0xffff)
+				break;
+			msleep(20);
+			waited += 20;
+		}
+		if (val && val != 0xffff)
+			dev_info(priv->device,
+				 "PHY answered PHYSID1=%04x after %u ms of settle\n",
+				 val, waited);
+		else
+			dev_info(priv->device,
+				 "no PHY answer after %u ms, scanning anyway\n",
+				 waited);
+	}
+
 	ret = stmmac_mdio_register(ndev);
 	if (ret < 0) {
 		dev_err_probe(priv->device, ret,
