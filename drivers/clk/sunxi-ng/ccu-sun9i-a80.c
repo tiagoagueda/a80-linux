@@ -14,6 +14,8 @@
 #include "ccu_div.h"
 #include "ccu_gate.h"
 #include "ccu_mp.h"
+#include "ccu_mult.h"
+#include "ccu_mux.h"
 #include "ccu_nkmp.h"
 #include "ccu_nm.h"
 #include "ccu_phase.h"
@@ -741,6 +743,13 @@ static SUNXI_CCU_GATE(bus_spi2_clk,	"bus-spi2",	"ahb0",
 static SUNXI_CCU_GATE(bus_spi3_clk,	"bus-spi3",	"ahb0",
 		      0x580, BIT(23), 0);
 
+/*
+ * USB OTG PHY clock. The A80 BSP calls this "usbotgphy"; it is a plain
+ * gate on HOSC at USB_CFG, and is required by the USB 3.0 PHY block.
+ */
+static SUNXI_CCU_GATE(usb_otg_phy_clk,	"usb-otg-phy",	"osc24M",
+		      0x450, BIT(31), 0);
+
 /* AHB1 bus gates */
 static SUNXI_CCU_GATE(bus_otg_clk,	"bus-otg",	"ahb1",
 		      0x584, BIT(0), 0);
@@ -922,6 +931,7 @@ static struct ccu_common *sun9i_a80_ccu_clks[] = {
 	&bus_spi3_clk.common,
 
 	/* AHB1 bus gates */
+	&usb_otg_phy_clk.common,
 	&bus_otg_clk.common,
 	&bus_usb_clk.common,
 	&bus_gmac_clk.common,
@@ -1067,6 +1077,7 @@ static struct clk_hw_onecell_data sun9i_a80_hw_clks = {
 		[CLK_BUS_SPI3]		= &bus_spi3_clk.common.hw,
 
 		[CLK_BUS_OTG]		= &bus_otg_clk.common.hw,
+		[CLK_USB_OTG_PHY]	= &usb_otg_phy_clk.common.hw,
 		[CLK_BUS_USB]		= &bus_usb_clk.common.hw,
 		[CLK_BUS_GMAC]		= &bus_gmac_clk.common.hw,
 		[CLK_BUS_MSGBOX]	= &bus_msgbox_clk.common.hw,
@@ -1211,9 +1222,43 @@ static void sun9i_a80_cpu_pll_fixup(void __iomem *reg)
 	writel(val, reg);
 }
 
+/*
+ * The CPU cluster PLLs cannot be reclocked while a cluster is running from
+ * them.  Park the cluster on the 24 MHz oscillator (mux parent 0) for the
+ * duration of the rate change, then restore the original parent.
+ */
+static struct ccu_pll_nb sun9i_a80_pll_c0cpux_nb = {
+	.common	= &pll_c0cpux_clk.common,
+	/* copy from pll_c0cpux_clk */
+	.enable	= BIT(31),
+	.lock	= BIT(0),
+};
+
+static struct ccu_pll_nb sun9i_a80_pll_c1cpux_nb = {
+	.common	= &pll_c1cpux_clk.common,
+	/* copy from pll_c1cpux_clk */
+	.enable	= BIT(31),
+	.lock	= BIT(1),
+};
+
+static struct ccu_mux_nb sun9i_a80_c0cpux_nb = {
+	.common		= &c0cpux_clk.common,
+	.cm		= &c0cpux_clk.mux,
+	.delay_us	= 1, /* > 8 clock cycles at 24 MHz */
+	.bypass_index	= 0, /* index of 24 MHz oscillator */
+};
+
+static struct ccu_mux_nb sun9i_a80_c1cpux_nb = {
+	.common		= &c1cpux_clk.common,
+	.cm		= &c1cpux_clk.mux,
+	.delay_us	= 1, /* > 8 clock cycles at 24 MHz */
+	.bypass_index	= 0, /* index of 24 MHz oscillator */
+};
+
 static int sun9i_a80_ccu_probe(struct platform_device *pdev)
 {
 	void __iomem *reg;
+	int ret;
 	u32 val;
 
 	reg = devm_platform_ioremap_resource(pdev, 0);
@@ -1229,7 +1274,21 @@ static int sun9i_a80_ccu_probe(struct platform_device *pdev)
 	sun9i_a80_cpu_pll_fixup(reg + SUN9I_A80_PLL_C0CPUX_REG);
 	sun9i_a80_cpu_pll_fixup(reg + SUN9I_A80_PLL_C1CPUX_REG);
 
-	return devm_sunxi_ccu_probe(&pdev->dev, reg, &sun9i_a80_ccu_desc);
+	ret = devm_sunxi_ccu_probe(&pdev->dev, reg, &sun9i_a80_ccu_desc);
+	if (ret)
+		return ret;
+
+	/* Gate then ungate the cluster PLLs after any rate change */
+	ccu_pll_notifier_register(&sun9i_a80_pll_c0cpux_nb);
+	ccu_pll_notifier_register(&sun9i_a80_pll_c1cpux_nb);
+
+	/* Reparent the clusters to osc24M during cluster PLL rate changes */
+	ccu_mux_notifier_register(pll_c0cpux_clk.common.hw.clk,
+				  &sun9i_a80_c0cpux_nb);
+	ccu_mux_notifier_register(pll_c1cpux_clk.common.hw.clk,
+				  &sun9i_a80_c1cpux_nb);
+
+	return 0;
 }
 
 static const struct of_device_id sun9i_a80_ccu_ids[] = {

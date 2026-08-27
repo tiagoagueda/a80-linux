@@ -43,6 +43,6 @@
 
 /* module clocks and bus gates exported */
 
-#define CLK_NUMBER		(CLK_BUS_UART5 + 1)
+#define CLK_NUMBER		(CLK_USB_OTG_PHY + 1)
 
 #endif /* _CCU_SUN9I_A80_H_ */

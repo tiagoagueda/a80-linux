@@ -159,4 +159,6 @@
 #define CLK_BUS_UART4		128
 #define CLK_BUS_UART5		129
 
+#define CLK_USB_OTG_PHY		130
+
 #endif /* _DT_BINDINGS_CLOCK_SUN9I_A80_CCU_H_ */
