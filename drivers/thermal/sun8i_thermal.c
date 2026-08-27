@@ -54,6 +54,16 @@
 
 #define SUN50I_THS_CTRL0_T_ACQ(x)		(GENMASK(15, 0) & ((x) - 1))
 #define SUN50I_THS_CTRL0_T_SAMPLE_PER(x)	((GENMASK(15, 0) & ((x) - 1)) << 16)
+/*
+ * On the A80 the thermal sensors live inside the GPADC: the memory map lists
+ * "General Purpose ADC" and "Thermal Sensor" at the same base, with the ADC
+ * registers at 0x00/0x04 and the THS registers from 0x40.  The register layout
+ * from 0x40 up matches the sun8i THS exactly, but the ADC has to be switched on
+ * before any THS write takes effect.
+ */
+#define SUN9I_A80_THS_ADC_CTRL1			0x04
+#define SUN9I_A80_THS_ADC_EN			BIT(16)
+
 #define SUN50I_THS_FILTER_EN			BIT(2)
 #define SUN50I_THS_FILTER_TYPE(x)		(GENMASK(1, 0) & (x))
 #define SUN50I_H6_THS_PC_TEMP_PERIOD(x)		((GENMASK(19, 0) & (x)) << 12)
@@ -472,6 +482,49 @@ static int sun8i_h3_thermal_init(struct ths_device *tmdev)
 	return 0;
 }
 
+static int sun9i_a80_thermal_init(struct ths_device *tmdev)
+{
+	int val;
+
+	/*
+	 * Average over 16 samples.  Without filtering the A80 sensors are
+	 * unusable - raw readings swing by ~300 counts, roughly 40 degrees,
+	 * which is more than the idle-to-load difference being measured.
+	 */
+	regmap_write(tmdev->regmap, SUN8I_THS_MFC,
+		     SUN50I_THS_FILTER_EN |
+		     SUN50I_THS_FILTER_TYPE(3));
+
+	val = GENMASK(7 + tmdev->chip->sensor_num, 8);
+	regmap_write(tmdev->regmap, SUN8I_THS_IC,
+		     SUN50I_H6_THS_PC_TEMP_PERIOD(365) | val);
+
+	/*
+	 * Deliberately do NOT touch offset 0x00.  On the sun8i parts that is
+	 * THS_CTRL0, but on the A80 it is the GPADC's ADC_CTRL0, where bits
+	 * 31:16 are FS_DIV and 15:0 are TACQ.  Writing the sun8i T_ACQ0(479)
+	 * value there sets TACQ=479 and clears FS_DIV to 0, which breaks the
+	 * manual's requirement that FS_TIME >= TACQ + conversion time and
+	 * yields readings ~27 C below the truth (30.7 C vs a measured 58.2 C).
+	 * The reset defaults (FS_DIV=0xf, TACQ=0) are correct here.
+	 */
+
+	/* The THS is part of the GPADC - enable the ADC before the sensors. */
+	regmap_write(tmdev->regmap, SUN9I_A80_THS_ADC_CTRL1,
+		     SUN9I_A80_THS_ADC_EN);
+
+	/*
+	 * SENSOR_ACQ = 0x3f.  Verified from userspace: with the reset default
+	 * of 4 the raw readings swing by ~300 counts; at 0x3f with the filter
+	 * on they hold to +/-2.
+	 */
+	val = GENMASK(tmdev->chip->sensor_num - 1, 0);
+	regmap_write(tmdev->regmap, SUN8I_THS_CTRL2,
+		     SUN8I_THS_CTRL2_T_ACQ1(0x3f) | val);
+
+	return 0;
+}
+
 static int sun50i_h6_thermal_init(struct ths_device *tmdev)
 {
 	int val;
@@ -607,6 +660,28 @@ static const struct ths_thermal_chip sun8i_a83t_ths = {
 	.calc_temp = sun8i_ths_calc_temp,
 };
 
+/*
+ * A80 User Manual 3.21:  Tem = (THS_DATA - 2794) / -14.882
+ * In the driver's form, offset - reg * scale / 10 in millidegrees:
+ *     scale  = 1000 / 14.882 * 10 = 672
+ *     offset = 2794 * 1000 / 14.882 = 187744
+ * Check: raw 1928 -> 187744 - 1928 * 672 / 10 = 58182 mC, measured 58.2 C.
+ *
+ * Four sensors, sited beside each CPU cluster, the GPU and the DRAM interface.
+ */
+static const struct ths_thermal_chip sun9i_a80_ths = {
+	.sensor_num = 4,
+	.scale = 672,
+	.offset = 187744,
+	.has_mod_clk = true,
+	.has_bus_clk_reset = true,
+	.temp_data_base = SUN8I_THS_TEMP_DATA,
+	.calibrate = sun8i_h3_ths_calibrate,
+	.init = sun9i_a80_thermal_init,
+	.irq_ack = sun8i_h3_irq_ack,
+	.calc_temp = sun8i_ths_calc_temp,
+};
+
 static const struct ths_thermal_chip sun8i_h3_ths = {
 	.sensor_num = 1,
 	.scale = 1211,
@@ -712,6 +787,7 @@ static const struct ths_thermal_chip sun50i_h616_ths = {
 static const struct of_device_id of_ths_match[] = {
 	{ .compatible = "allwinner,sun8i-a83t-ths", .data = &sun8i_a83t_ths },
 	{ .compatible = "allwinner,sun8i-h3-ths", .data = &sun8i_h3_ths },
+	{ .compatible = "allwinner,sun9i-a80-ths", .data = &sun9i_a80_ths },
 	{ .compatible = "allwinner,sun8i-r40-ths", .data = &sun8i_r40_ths },
 	{ .compatible = "allwinner,sun50i-a64-ths", .data = &sun50i_a64_ths },
 	{ .compatible = "allwinner,sun50i-a100-ths", .data = &sun50i_a100_ths },
