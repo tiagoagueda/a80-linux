@@ -15,6 +15,7 @@
 #include <linux/cpu_pm.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/soc/sunxi/arisc.h>
 #include <linux/iopoll.h>
 #include <linux/irqchip/arm-gic.h>
 #include <linux/of.h>
@@ -53,6 +54,7 @@
 #define CPUCFG_CX_RST_CTRL_H_RST	BIT(12)
 #define CPUCFG_CX_RST_CTRL_L2_RST	BIT(8)
 #define CPUCFG_CX_RST_CTRL_CX_RST(n)	BIT(4 + (n))
+#define CPUCFG_CX_RST_CTRL_CX_RST_ALL	(0xf << 4)
 #define CPUCFG_CX_RST_CTRL_CORE_RST(n)	BIT(n)
 #define CPUCFG_CX_RST_CTRL_CORE_RST_ALL	(0xf << 0)
 
@@ -112,10 +114,90 @@ static bool sunxi_core_is_cortex_a15(unsigned int core, unsigned int cluster)
 	return is_compatible;
 }
 
+/*
+ * Poll a power-switch register until it reaches the expected value.
+ *
+ * The vendor BSP spins on these reads rather than relying on a fixed delay;
+ * the daisy-chained clamp takes a variable time to settle.  Bounded here so a
+ * wedged clamp cannot hang the boot.
+ */
+static int sunxi_cpu_power_switch_wait(unsigned int cpu, unsigned int cluster,
+				       u32 want)
+{
+	unsigned int tries = 1000;
+
+	while (readl(prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu)) != want) {
+		if (!--tries) {
+			pr_err("power clamp cluster %u cpu %u stuck, want %02x\n",
+			       cluster, cpu, want);
+			return -ETIMEDOUT;
+		}
+		udelay(10);
+	}
+
+	return 0;
+}
+
+/*
+ * A80 cluster 1 (Cortex-A15) uses the OPPOSITE power-clamp convention from
+ * cluster 0 (Cortex-A7):
+ *
+ *   A7   ramps DOWN 0xe0 -> 0x80 -> 0x00, and 0x00 means POWERED ON
+ *   A15  ramps UP   0x01 -> 0x07 -> 0x1f -> 0x7f -> 0xff, 0xff means ON
+ *
+ * The vendor BSP dispatches on cluster for exactly this reason
+ * (sun9i_cpu_power_switch_set -> sun9i_ca7/ca15_power_switch_set).  Driving the
+ * A7 sequence on the A15 clamp writes 0x00, which switches that cluster OFF -
+ * which is why the A15 cores never came online.
+ *
+ * The A83T is unaffected: both of its clusters use the A7 convention.
+ */
+static int sunxi_cpu_power_switch_set_a15(unsigned int cpu, unsigned int cluster,
+					  bool enable)
+{
+	u32 reg = readl(prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu));
+
+	if (enable) {
+		if (reg == 0xff) {
+			pr_debug("power clamp cluster %u cpu %u already open\n",
+				 cluster, cpu);
+			return 0;
+		}
+
+		writel(0x01, prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu));
+		udelay(20);
+		writel(0x07, prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu));
+		udelay(10);
+		writel(0x1f, prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu));
+		udelay(10);
+		writel(0x7f, prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu));
+		udelay(10);
+		writel(0xff, prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu));
+		udelay(20);
+
+		return sunxi_cpu_power_switch_wait(cpu, cluster, 0xff);
+	}
+
+	if (reg == 0x00) {
+		pr_debug("power clamp cluster %u cpu %u already closed\n",
+			 cluster, cpu);
+		return 0;
+	}
+
+	writel(0x00, prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu));
+	udelay(30);
+
+	return sunxi_cpu_power_switch_wait(cpu, cluster, 0x00);
+}
+
 static int sunxi_cpu_power_switch_set(unsigned int cpu, unsigned int cluster,
 				      bool enable)
 {
 	u32 reg;
+
+	/* A80 cluster 1 is the A15 and inverts the clamp encoding */
+	if (!is_a83t && cluster == 1)
+		return sunxi_cpu_power_switch_set_a15(cpu, cluster, enable);
 
 	/* control sequence from Allwinner A80 user manual v1.2 PRCM section */
 	reg = readl(prcm_base + PRCM_PWR_SWITCH_REG(cluster, cpu));
@@ -228,6 +310,9 @@ static int sunxi_cpu_powerup(unsigned int cpu, unsigned int cluster)
 	reg |= PRCM_CPU_PO_RST_CTRL_CORE(cpu);
 	writel(reg, prcm_base + PRCM_CPU_PO_RST_CTRL(cluster));
 
+	/* the vendor settles here before releasing the core reset */
+	udelay(60);
+
 	if (is_a83t) {
 		reg  = readl(r_cpucfg_base +
 			     R_CPUCFG_CLUSTER_PO_RST_CTRL(cluster));
@@ -250,6 +335,171 @@ static int sunxi_cpu_powerup(unsigned int cpu, unsigned int cluster)
 	return 0;
 }
 
+/*
+ * Tronsmart Draco AW80: VDD_CPU_A15 is not a PMIC rail. It comes from an
+ * external DC-DC enabled by a15_pwr_en (PL02) with a 3-bit voltage select on
+ * a15_vset1..3 (PL03/04/05), per the board's own script.bin.
+ *
+ * Codes measured on the board (PL05,PL04,PL03): 000=1200mV 001=900mV
+ * 010=1000mV 100=1100mV 101=840mV.
+ *
+ * The rail MUST be raised while the cluster power domain is isolated. Enabling
+ * it with the per-core power switches already closed (which is how U-Boot
+ * leaves them, 0xff) collapses the SoC instantly - no panic, no console.
+ */
+#define SUN9I_R_PIO_PBASE	0x08002c00
+#define SUN9I_R_PIO_PL_CFG0	0x00
+#define SUN9I_R_PIO_PL_DATA	0x10
+#define A15_PWR_EN		2
+#define A15_VSET_SHIFT		3
+#define A15_VSET_900MV		0	/* code 000 = 1200 mV per AR100 */
+
+static void sun9i_a15_domain_isolate(void)
+{
+	u32 reg;
+	int i;
+
+	/*
+	 * Open every per-core power switch and gate the cores and the
+	 * cluster before anyone raises VDD_CPU_A15. Energising the rail
+	 * into an already-connected domain collapses the SoC instantly,
+	 * with nothing on the console. The AR100 owns the rail itself.
+	 */
+	for (i = 0; i < SUNXI_CPUS_PER_CLUSTER; i++)
+		writel(0x00, prcm_base + PRCM_PWR_SWITCH_REG(1, i));
+	reg = readl(prcm_base + PRCM_PWROFF_GATING_REG(1));
+	writel(reg | 0x1f, prcm_base + PRCM_PWROFF_GATING_REG(1));
+	udelay(20);
+}
+
+/*
+ * A80 cluster power-up is not something the ARM side can do alone: the
+ * voltage rail and the cluster power sequencing live behind the AR100
+ * coprocessor, and the vendor code refuses to even try unless it is up.
+ * A single DVFS request performs the power-on and sets the operating
+ * point; there is no separate power-on message.
+ *
+ * TODO: these operating points are board data and should come from the
+ * cpu OPP tables rather than being hardcoded here.
+ */
+static const struct sunxi_arisc_vf sun9i_a7_vf[] = {
+	{ 1200000000, 1020 },
+	{ 1104000000,  960 },
+	{ 1008000000,  900 },
+	{  816000000,  840 },
+};
+static const struct sunxi_arisc_vf sun9i_a15_vf[] = {
+	{ 2016000000, 1200 },
+	{ 1800000000, 1100 },
+	{ 1608000000, 1000 },
+	{ 1200000000,  900 },
+};
+
+#define SUN9I_A15_BOOT_KHZ	1800000
+#define SUN9I_A15_BOOT_MV	1100
+#define SUN9I_A15_VOLT_TYPE	29	/* external CPU-B DC-DC */
+
+/*
+ * a15_pwr_en is PL02 on this board. The AR100 drives the three vset lines
+ * (PL03..PL05) when it changes CPU-B voltage, but it never touches the
+ * enable, so the rail stays off and the cores never execute even after a
+ * DVFS request the coprocessor reports as successful.
+ */
+#define SUN9I_R_PIO_PBASE	0x08002c00
+#define SUN9I_R_PIO_PL_CFG0	0x00
+#define SUN9I_R_PIO_PL_DATA	0x10
+#define SUN9I_A15_PWR_EN	2
+
+static void sun9i_a15_rail_enable(void)
+{
+	void __iomem *rp;
+	u32 reg;
+
+	rp = ioremap(SUN9I_R_PIO_PBASE, 0x400);
+	if (!rp)
+		return;
+
+	/* R_PIO is clock-gated and in reset this early; ungate it ourselves. */
+	writel(readl(prcm_base + 0x28) | BIT(0), prcm_base + 0x28);
+	writel(readl(prcm_base + 0xb0) | BIT(0), prcm_base + 0xb0);
+	udelay(10);
+
+	reg = readl(rp + SUN9I_R_PIO_PL_CFG0);
+	reg &= ~(0xfu << (SUN9I_A15_PWR_EN * 4));
+	reg |= (0x1u << (SUN9I_A15_PWR_EN * 4));
+	writel(reg, rp + SUN9I_R_PIO_PL_CFG0);
+	writel(readl(rp + SUN9I_R_PIO_PL_DATA) | BIT(SUN9I_A15_PWR_EN),
+	       rp + SUN9I_R_PIO_PL_DATA);
+	mdelay(10);
+
+	pr_info("sunxi mc_smp: a15_pwr_en asserted, PL CFG0=%08x DATA=%08x\n",
+		readl(rp + SUN9I_R_PIO_PL_CFG0),
+		readl(rp + SUN9I_R_PIO_PL_DATA));
+	iounmap(rp);
+}
+
+static int sun9i_a15_cluster_power_on(void)
+{
+	int ret;
+
+	if (!sunxi_arisc_is_ready()) {
+		pr_info("sunxi mc_smp: AR100 not up yet, cannot power the A15 cluster\n");
+		return -EAGAIN;
+	}
+
+	/*
+	 * The vendor loads the tables for *both* clusters before issuing any
+	 * DVFS request. The handler looks a voltage up by frequency, so a
+	 * cluster with an empty table has nothing to raise its rail to.
+	 */
+	ret = sunxi_arisc_dvfs_cfg_vf_table(0, sun9i_a7_vf,
+					    ARRAY_SIZE(sun9i_a7_vf));
+	if (ret) {
+		pr_err("sunxi mc_smp: A7 v-f table failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = sunxi_arisc_dvfs_cfg_vf_table(1, sun9i_a15_vf,
+					    ARRAY_SIZE(sun9i_a15_vf));
+	if (ret) {
+		pr_err("sunxi mc_smp: A15 v-f table failed: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Put the rail at the operating point we are about to ask for. The
+	 * DVFS handler sets the voltage, reads it back and fails the whole
+	 * request if the two differ:
+	 *   [ERR]:current voltage:%u != target voltage:%u
+	 * The rail comes out of reset at 1200 mV, so asking for a lower
+	 * operating point without this fails before anything is powered.
+	 */
+	ret = sunxi_arisc_get_volt(SUN9I_A15_VOLT_TYPE);
+	pr_info("sunxi mc_smp: A15 rail at %d mV, target %d mV\n",
+		ret, SUN9I_A15_BOOT_MV);
+	if (ret != SUN9I_A15_BOOT_MV) {
+		ret = sunxi_arisc_set_volt(SUN9I_A15_VOLT_TYPE, SUN9I_A15_BOOT_MV);
+		if (ret) {
+			pr_err("sunxi mc_smp: A15 rail preset failed: %d\n", ret);
+			return ret;
+		}
+		pr_info("sunxi mc_smp: A15 rail now %d mV\n",
+			sunxi_arisc_get_volt(SUN9I_A15_VOLT_TYPE));
+	}
+	/* pll2 selects cluster 1; freq is in kHz */
+	ret = sunxi_arisc_dvfs_set_cpufreq(SUN9I_A15_BOOT_KHZ, 2);
+	if (ret) {
+		pr_err("sunxi mc_smp: A15 power-on failed: %d\n", ret);
+		return ret;
+	}
+
+	/* voltage is set; now actually switch the rail on */
+	sun9i_a15_rail_enable();
+	pr_info("sunxi mc_smp: A15 cluster powered on at %u kHz\n",
+		SUN9I_A15_BOOT_KHZ);
+	return 0;
+}
+
 static int sunxi_cluster_powerup(unsigned int cluster)
 {
 	u32 reg;
@@ -265,6 +515,14 @@ static int sunxi_cluster_powerup(unsigned int cluster)
 		writel(reg, cpucfg_base + CPUCFG_CX_RST_CTRL(cluster));
 		udelay(10);
 	}
+
+	/*
+	 * A80 cluster 1 has no supply until its external DC-DC is enabled, and
+	 * that must happen with the power domain isolated. Do it before any
+	 * reset handling below.
+	 */
+	if (!is_a83t && cluster == 1)
+		sun9i_a15_domain_isolate();
 
 	/* assert ACINACTM */
 	reg = readl(cpucfg_base + CPUCFG_CX_CTRL_REG1(cluster));
@@ -294,11 +552,16 @@ static int sunxi_cluster_powerup(unsigned int cluster)
 	reg &= ~CPUCFG_CX_RST_CTRL_L2_RST;
 
 	/*
-	 * Allwinner code also asserts resets for NEON on A15. According
-	 * to ARM manuals, asserting power-on reset is sufficient.
+	 * The vendor asserts the NEON resets on A15 here and releases them
+	 * with the other cluster resets below. Mainline skipped that on the
+	 * grounds that power-on reset is sufficient per the ARM manuals,
+	 * which holds for a cluster that already had power - but this one is
+	 * coming up from a rail that was off entirely.
 	 */
 	if (!sunxi_core_is_cortex_a15(0, cluster))
 		reg &= ~CPUCFG_CX_RST_CTRL_ETM_RST_ALL;
+	else
+		reg &= ~CPUCFG_CX_RST_CTRL_CX_RST_ALL;
 
 	writel(reg, cpucfg_base + CPUCFG_CX_RST_CTRL(cluster));
 
@@ -314,6 +577,18 @@ static int sunxi_cluster_powerup(unsigned int cluster)
 	}
 	writel(reg, cpucfg_base + CPUCFG_CX_CTRL_REG0(cluster));
 
+	/*
+	 * Hand off to the AR100 here, exactly where the vendor does: after
+	 * L2RSTDISABLE is held low and before the cluster power gate is
+	 * cleared.
+	 */
+	if (!is_a83t && cluster == 1) {
+		int aret = sun9i_a15_cluster_power_on();
+
+		if (aret)
+			return aret;
+		mdelay(1);
+	}
 	/* clear cluster power gate */
 	reg = readl(prcm_base + PRCM_PWROFF_GATING_REG(cluster));
 	if (is_a83t)
@@ -328,6 +603,8 @@ static int sunxi_cluster_powerup(unsigned int cluster)
 	reg |= CPUCFG_CX_RST_CTRL_DBG_SOC_RST;
 	reg |= CPUCFG_CX_RST_CTRL_H_RST;
 	reg |= CPUCFG_CX_RST_CTRL_L2_RST;
+	if (sunxi_core_is_cortex_a15(0, cluster))
+		reg |= CPUCFG_CX_RST_CTRL_CX_RST_ALL;
 	writel(reg, cpucfg_base + CPUCFG_CX_RST_CTRL(cluster));
 
 	/* de-assert ACINACTM */
@@ -391,6 +668,7 @@ static void sunxi_mc_smp_secondary_init(unsigned int cpu)
 static int sunxi_mc_smp_boot_secondary(unsigned int l_cpu, struct task_struct *idle)
 {
 	unsigned int mpidr, cpu, cluster;
+	int ret;
 
 	mpidr = cpu_logical_map(l_cpu);
 	cpu = MPIDR_AFFINITY_LEVEL(mpidr, 0);
@@ -408,7 +686,15 @@ static int sunxi_mc_smp_boot_secondary(unsigned int l_cpu, struct task_struct *i
 
 	if (sunxi_mc_smp_cluster_is_down(cluster)) {
 		sunxi_mc_smp_first_comer = true;
-		sunxi_cluster_powerup(cluster);
+		ret = sunxi_cluster_powerup(cluster);
+		if (ret) {
+			/*
+			 * Leave the table alone so a later attempt retries the
+			 * power-up instead of assuming this CPU is already up.
+			 */
+			spin_unlock_irq(&boot_lock);
+			return ret;
+		}
 	} else {
 		sunxi_mc_smp_first_comer = false;
 	}
