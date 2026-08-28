@@ -78,6 +78,10 @@
 #define CPU0_SUPPORT_HOTPLUG_MAGIC1	0x790DCA3A
 
 static void __iomem *cpucfg_base;
+/* vendor sunxi-chip.c: bit 3 set means SUN9IW1P1_REV_B or later */
+#define PRCM_SOC_VER_REG		0x190
+#define PRCM_SOC_VER_REV_B		BIT(3)
+
 static void __iomem *prcm_base;
 static void __iomem *sram_b_smp_base;
 static void __iomem *r_cpucfg_base;
@@ -85,6 +89,7 @@ static void __iomem *r_cpucfg_base;
 extern void sunxi_mc_smp_secondary_startup(void);
 extern void sunxi_mc_smp_resume(void);
 static bool is_a83t;
+static bool is_sun9i_rev_a;
 
 static bool sunxi_core_is_cortex_a15(unsigned int core, unsigned int cluster)
 {
@@ -139,16 +144,25 @@ static int sunxi_cpu_power_switch_wait(unsigned int cpu, unsigned int cluster,
 }
 
 /*
- * A80 cluster 1 (Cortex-A15) uses the OPPOSITE power-clamp convention from
- * cluster 0 (Cortex-A7):
+ * On A80 rev A silicon ONLY, cluster 1 (Cortex-A15) uses the opposite
+ * power-clamp convention from cluster 0 (Cortex-A7):
  *
- *   A7   ramps DOWN 0xe0 -> 0x80 -> 0x00, and 0x00 means POWERED ON
- *   A15  ramps UP   0x01 -> 0x07 -> 0x1f -> 0x7f -> 0xff, 0xff means ON
+ *   A7        ramps DOWN 0xfe -> 0xf8 -> 0xe0 -> 0x80 -> 0x00, 0x00 = ON
+ *   A15 rev A ramps UP   0x01 -> 0x07 -> 0x1f -> 0x7f -> 0xff, 0xff = ON
  *
- * The vendor BSP dispatches on cluster for exactly this reason
- * (sun9i_cpu_power_switch_set -> sun9i_ca7/ca15_power_switch_set).  Driving the
- * A7 sequence on the A15 clamp writes 0x00, which switches that cluster OFF -
- * which is why the A15 cores never came online.
+ * The vendor BSP has a dedicated A15 path for this, but it is gated on the
+ * stepping and the guard is easy to miss:
+ *
+ *	sun9i_ca15_power_switch_set():
+ *		if (sunxi_get_soc_ver() >= SUN9IW1P1_REV_B)
+ *			... the A7 sequence, verbatim
+ *		else
+ *			... the inverted sequence
+ *
+ * So from rev B onward both clusters behave identically and the plain
+ * sequence below is correct for all four A15 cores.  Getting this wrong on
+ * a rev B part clamps the core off at the exact moment it is released from
+ * reset, and it never fetches a single instruction.
  *
  * The A83T is unaffected: both of its clusters use the A7 convention.
  */
@@ -195,8 +209,8 @@ static int sunxi_cpu_power_switch_set(unsigned int cpu, unsigned int cluster,
 {
 	u32 reg;
 
-	/* A80 cluster 1 is the A15 and inverts the clamp encoding */
-	if (!is_a83t && cluster == 1)
+	/* only pre-rev-B A80 silicon inverts the clamp encoding on the A15 */
+	if (!is_a83t && cluster == 1 && is_sun9i_rev_a)
 		return sunxi_cpu_power_switch_set_a15(cpu, cluster, enable);
 
 	/* control sequence from Allwinner A80 user manual v1.2 PRCM section */
@@ -1121,6 +1135,18 @@ static int __init sunxi_mc_smp_init(void)
 		pr_err("%s: failed to map PRCM registers\n", __func__);
 		ret = -ENOMEM;
 		goto err_put_nodes;
+	}
+
+	/*
+	 * The A15 power-clamp encoding depends on the stepping; see
+	 * sunxi_cpu_power_switch_set_a15().  sunxi-chip.c in the vendor BSP
+	 * reads it out of this one bit.
+	 */
+	if (!is_a83t) {
+		is_sun9i_rev_a = !(readl(prcm_base + PRCM_SOC_VER_REG) &
+				   PRCM_SOC_VER_REV_B);
+		pr_info("%s: A80 stepping: rev %c\n", __func__,
+			is_sun9i_rev_a ? 'A' : 'B');
 	}
 
 	cpucfg_base = of_io_request_and_map(nodes.cpucfg_node, 0,
