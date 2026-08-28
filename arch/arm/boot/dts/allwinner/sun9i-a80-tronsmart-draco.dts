@@ -200,22 +200,26 @@
 	vmmc-supply = <&reg_dcdce>;
 	bus-width = <4>;
 	/*
-	 * Card detect is PH17.  This was PH18 until 2026-08-28, taken from the
-	 * sys_config.fex found in the vendor rootfs - the same file that claims
-	 * machine = "cubieboard4" and is wrong about USB, WiFi and the A15 rail
-	 * (see 33-REAL-PINMAP.md).  The board's own script.bin has
-	 * sdc_det = port:PH17<6><1><2><default>, and PH18 is spdif_dout.
+	 * Card detect is PH17, active low, and it works.  This was PH18 until
+	 * 2026-08-28, taken from the sys_config.fex found in the vendor rootfs
+	 * - the same file that claims machine = "cubieboard4" and is wrong
+	 * about USB, WiFi and the A15 rail (see 33-REAL-PINMAP.md).  The
+	 * board's own script.bin has sdc_det = port:PH17<6><1><2><default>,
+	 * and PH18 is spdif_dout.
 	 *
-	 * That also explains the note this comment used to carry: with a
-	 * pull-up on PH18 the line never went low on insertion, and the
-	 * conclusion drawn was that the detect switch did not reach the pin.
-	 * It does not - because the switch is on PH17.
+	 * That also explains a note this comment used to carry: with a pull-up
+	 * on PH18 the line never went low on insertion, and the conclusion
+	 * drawn was that the detect switch did not reach the pin.  It does not
+	 * - because the switch is on PH17.
 	 *
-	 * broken-cd is kept for now: polling is known to work, and nobody has
-	 * yet inserted and removed a card while watching PH17.  Once someone
-	 * has, this should become cd-gpios and broken-cd should go.
+	 * Verified by watching the pin across two insert/remove cycles:
+	 *   t=37s  HIGH -> LOW   card inserted
+	 *   t=51s  LOW  -> HIGH  card removed
+	 *   t=70s  HIGH -> LOW   card inserted
+	 *   t=84s  LOW  -> HIGH  card removed
+	 * so broken-cd polling is no longer needed.
 	 */
-	broken-cd;
+	cd-gpios = <&pio 7 17 GPIO_ACTIVE_LOW>;
 	/*
 	 * Cap the bus clock.  Left uncapped this controller enumerates a card
 	 * and then fails every transfer:
