@@ -1471,6 +1471,22 @@
 			pinctrl-0 = <&r_ir_pins>;
 			clocks = <&apbs_gates 1>, <&r_ir_clk>;
 			clock-names = "apb", "ir";
+			/*
+			 * The board comes out of the bootloader with r_ir_clk
+			 * muxed to osc32k and M=15 - 32768/16 = 2048 Hz.
+			 * sunxi-cir asks for 8 MHz and converts hardware
+			 * sample counts to microseconds assuming it got it,
+			 * but a mod0 clock only divides from whatever parent
+			 * it already has and never reparents. Nothing decodes:
+			 * a 9 ms NEC leader is reported as 32 us.
+			 *
+			 * These go on the consumer, not on r_ir_clk itself -
+			 * that is a CLK_OF_DECLARE clock with no platform
+			 * device, so of_clk_set_defaults() never runs for it.
+			 */
+			assigned-clocks = <&r_ir_clk>;
+			assigned-clock-parents = <&osc24M>;
+			assigned-clock-rates = <8000000>;
 			resets = <&apbs_rst 1>;
 			reg = <0x08002000 0x40>;
 			status = "disabled";
