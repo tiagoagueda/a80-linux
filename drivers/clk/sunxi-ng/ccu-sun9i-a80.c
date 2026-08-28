@@ -66,6 +66,18 @@ static struct ccu_mult pll_c1cpux_clk = {
  * The Audio PLL has d1, d2 dividers in addition to the usual N, M
  * factors. Since we only need 2 frequencies from this PLL: 22.5792 MHz
  * and 24.576 MHz, ignore them for now. Enforce d1 = 0 and d2 = 0.
+ *
+ * M is a plain "+1" divider like every other one in this CCU. It was modelled
+ * with a zero offset, which made every audio clock on the SoC 1/(1 + 1/M) too
+ * slow while reading back as exactly correct: asked for 122.88 MHz the
+ * framework wrote M = 25 and the hardware produced 24 MHz * 128 / 26 =
+ * 118.15 MHz. Measured on a Tronsmart Draco AW80 Telos by timing playback of
+ * a buffer of known length - 60 s of 48 kHz took 62.564 s, a factor of exactly
+ * 26/25 - and independently by the HDMI transmitter's own automatic CTS
+ * counter, which read 154440 where 1080p60 wants 148500, the same 1.04. With
+ * the offset corrected both land on the nose: 60.157 s and 148500.
+ *
+ * A zero offset also lets M = 0 ask for a division by zero.
  */
 #define SUN9I_A80_PLL_AUDIO_REG	0x008
 
@@ -73,7 +85,7 @@ static struct ccu_nm pll_audio_clk = {
 	.enable		= BIT(31),
 	.lock		= BIT(2),
 	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 0, 12, 0),
-	.m		= _SUNXI_CCU_DIV_OFFSET(0, 6, 0),
+	.m		= _SUNXI_CCU_DIV(0, 6),
 	.common		= {
 		.reg		= 0x008,
 		.lock_reg	= CCU_SUN9I_LOCK_REG,
