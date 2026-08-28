@@ -29,6 +29,7 @@
 #include "sun4i_backend.h"
 #include "sun4i_drv.h"
 #include "sun4i_frontend.h"
+#include "sun6i_drc.h"
 #include "sun4i_layer.h"
 #include "sunxi_engine.h"
 
@@ -38,6 +39,9 @@ struct sun4i_backend_quirks {
 
 	/* alpha at the lowest z position is not always supported */
 	bool supports_lowest_plane_alpha;
+
+	/* the display engine needs a physical address, not a DMA one */
+	bool needs_dram_phys_offset;
 };
 
 static const u32 sunxi_rgb2yuv_coef[12] = {
@@ -263,7 +267,15 @@ int sun4i_backend_update_layer_formats(struct sun4i_backend *backend,
 			   SUN4I_BACKEND_ATTCTL_REG0_LAY_YUVEN, 0);
 
 	val = SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA(state->alpha >> 8);
-	if (state->alpha != DRM_BLEND_ALPHA_OPAQUE)
+	/*
+	 * A format with no alpha channel leaves the per-pixel alpha
+	 * undefined. On the A80 the blender reads those padding bits as
+	 * zero and composites the layer away completely - the picture is
+	 * there in memory, the backend fetches it, and nothing reaches the
+	 * screen. Fall back to the register's global alpha, which is
+	 * already being programmed just above.
+	 */
+	if (state->alpha != DRM_BLEND_ALPHA_OPAQUE || !fb->format->has_alpha)
 		val |= SUN4I_BACKEND_ATTCTL_REG0_LAY_GLBALPHA_EN;
 	regmap_update_bits(backend->engine.regs,
 			   SUN4I_BACKEND_ATTCTL_REG0(layer),
@@ -346,6 +358,26 @@ int sun4i_backend_update_layer_buffer(struct sun4i_backend *backend,
 
 	if (fb->format->is_yuv)
 		return sun4i_backend_update_yuv_buffer(backend, fb, dma_addr);
+
+	/*
+	 * On the A80 the display engine needs the physical address, and
+	 * what we are handed here is 0x20000000 low - exactly the base of
+	 * DRAM on this SoC. Measured on a Tronsmart Draco AW80: the
+	 * framebuffer sits at physical 0xfc900000 and this code programs
+	 * 0xdc900000, so the backend scans out uninitialised memory and
+	 * the screen is noise.
+	 *
+	 * Both addresses give the same low word once shifted left by 3,
+	 * differing only in the four high bits, which is why this hid for
+	 * so long behind everything else that was wrong.
+	 *
+	 * There is no dma-ranges in this SoC's device tree, so the DMA
+	 * layer ought to be handing us an identity mapping already. Why it
+	 * does not has NOT been established. This corrects the symptom on
+	 * sun9i; the root cause still needs finding.
+	 */
+	if (backend->quirks->needs_dram_phys_offset)
+		dma_addr += PHYS_OFFSET;
 
 	/* Write the 32 lower bits of the address (in bits) */
 	lo_paddr = dma_addr << 3;
@@ -655,6 +687,11 @@ static void sun4i_backend_mode_set(struct sunxi_engine *engine,
 	regmap_update_bits(engine->regs, SUN4I_BACKEND_MODCTL_REG,
 			   SUN4I_BACKEND_MODCTL_ITLMOD_EN,
 			   interlaced ? SUN4I_BACKEND_MODCTL_ITLMOD_EN : 0);
+
+	/* the A80 has a DRC between us and the TCON that has to be told
+	 * the size and switched on, or nothing reaches the display */
+	sun6i_drc_engine_mode_set(engine->node, mode->hdisplay,
+				  mode->vdisplay);
 
 	DRM_DEBUG_DRIVER("Switching display backend interlaced mode %s\n",
 			 interlaced ? "on" : "off");
@@ -999,6 +1036,7 @@ static const struct sun4i_backend_quirks sun8i_a33_backend_quirks = {
 };
 
 static const struct sun4i_backend_quirks sun9i_backend_quirks = {
+	.needs_dram_phys_offset = true,
 };
 
 static const struct of_device_id sun4i_backend_of_table[] = {
