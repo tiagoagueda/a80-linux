@@ -176,6 +176,7 @@ struct sun4i_i2s;
  */
 struct sun4i_i2s_quirks {
 	bool				has_reset;
+	bool				playback_only;
 	u64				pcm_formats;
 	unsigned int			reg_offset_txdata;	/* TX FIFO */
 	const struct regmap_config	*sun4i_i2s_regmap;
@@ -221,6 +222,8 @@ struct sun4i_i2s {
 
 	struct snd_dmaengine_dai_dma_data	capture_dma_data;
 	struct snd_dmaengine_dai_dma_data	playback_dma_data;
+
+	struct snd_soc_dai_driver		dai_drv;
 
 	/* Register fields for i2s */
 	struct regmap_field	*field_clkdiv_mclk_en;
@@ -1421,6 +1424,37 @@ static const struct sun4i_i2s_quirks sun8i_a83t_i2s_quirks = {
 	.set_fmt		= sun4i_i2s_set_soc_fmt,
 };
 
+/*
+ * DAUDIO1 on the A80 is the A83T's register file - TX FIFO at 0x20, MCLK
+ * enable at CLK_DIV bit 7, WSS at FMT0 bits 2-3, SR at bits 4-5 - and it is
+ * how the HDMI controller gets its audio, since that controller has no audio
+ * DMA of its own (CONFIG3_ID reads 0x00).
+ *
+ * It is transmit only.  The block has an RX FIFO, but the A80's DMA engine has
+ * no DRQ port for it: the BSP's include/linux/dma/sunxi-dma.h defines
+ * DRQSRC_DAUDIO_1_RX for every SoC *except* sun9i.  So the capture stream is
+ * dropped rather than left to fail at pcm_new() for want of an "rx" channel.
+ */
+static const struct sun4i_i2s_quirks sun9i_a80_i2s_quirks = {
+	.has_reset		= true,
+	.playback_only		= true,
+	.pcm_formats		= SUN4I_FORMATS_A10,
+	.reg_offset_txdata	= SUN8I_I2S_FIFO_TX_REG,
+	.sun4i_i2s_regmap	= &sun4i_i2s_regmap_config,
+	.field_clkdiv_mclk_en	= REG_FIELD(SUN4I_I2S_CLK_DIV_REG, 7, 7),
+	.field_fmt_wss		= REG_FIELD(SUN4I_I2S_FMT0_REG, 2, 3),
+	.field_fmt_sr		= REG_FIELD(SUN4I_I2S_FMT0_REG, 4, 5),
+	.bclk_dividers		= sun4i_i2s_bclk_div,
+	.num_bclk_dividers	= ARRAY_SIZE(sun4i_i2s_bclk_div),
+	.mclk_dividers		= sun4i_i2s_mclk_div,
+	.num_mclk_dividers	= ARRAY_SIZE(sun4i_i2s_mclk_div),
+	.get_bclk_parent_rate	= sun4i_i2s_get_bclk_parent_rate,
+	.get_sr			= sun4i_i2s_get_sr,
+	.get_wss		= sun4i_i2s_get_wss,
+	.set_chan_cfg		= sun4i_i2s_set_chan_cfg,
+	.set_fmt		= sun4i_i2s_set_soc_fmt,
+};
+
 static const struct sun4i_i2s_quirks sun8i_h3_i2s_quirks = {
 	.has_reset		= true,
 	.pcm_formats		= SUN4I_FORMATS_H3,
@@ -1607,9 +1641,13 @@ static int sun4i_i2s_probe(struct platform_device *pdev)
 		goto err_suspend;
 	}
 
+	i2s->dai_drv = sun4i_i2s_dai;
+	if (i2s->variant->playback_only)
+		memset(&i2s->dai_drv.capture, 0, sizeof(i2s->dai_drv.capture));
+
 	ret = devm_snd_soc_register_component(&pdev->dev,
 					      &sun4i_i2s_component,
-					      &sun4i_i2s_dai, 1);
+					      &i2s->dai_drv, 1);
 	if (ret) {
 		dev_err(&pdev->dev, "Could not register DAI\n");
 		goto err_suspend;
@@ -1656,6 +1694,10 @@ static const struct of_device_id sun4i_i2s_match[] = {
 	{
 		.compatible = "allwinner,sun8i-h3-i2s",
 		.data = &sun8i_h3_i2s_quirks,
+	},
+	{
+		.compatible = "allwinner,sun9i-a80-i2s",
+		.data = &sun9i_a80_i2s_quirks,
 	},
 	{
 		.compatible = "allwinner,sun50i-a64-codec-i2s",
