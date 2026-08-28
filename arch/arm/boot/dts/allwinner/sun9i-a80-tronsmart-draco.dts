@@ -36,6 +36,24 @@
 	model = "Tronsmart Draco AW80 Telos";
 	compatible = "tronsmart,draco-aw80", "allwinner,sun9i-a80";
 
+	spdif_out: spdif-out {
+		#sound-dai-cells = <0>;
+		compatible = "linux,spdif-dit";
+	};
+
+	sound-spdif {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "Draco S/PDIF";
+
+		simple-audio-card,cpu {
+			sound-dai = <&spdif>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&spdif_out>;
+		};
+	};
+
 	reserved-memory {
 		/* must match the root node, which is <2>/<2> on sun9i */
 		#address-cells = <2>;
@@ -175,24 +193,27 @@
 	};
 };
 
-/* [mmc0_para] SD card slot: 4-bit on PF0-PF5, card detect on PH18 */
+/* [mmc0_para] SD card slot: 4-bit on PF0-PF5, card detect on PH17 */
 &mmc0 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&mmc0_pins>, <&mmc0_cd_pin>;
 	vmmc-supply = <&reg_dcdce>;
 	bus-width = <4>;
 	/*
-	 * Card detect is PH18 and the vendor configures it with a pull-up
-	 * (sys_config.fex: sdc_det = port:PH18<6><1><2><default>).  Our tree
-	 * set no bias at all, so the line floated LOW and the driver believed
-	 * a card was permanently inserted - measured: slot empty reads 0 with
-	 * the pull off and 1 with it on.  mmc0_cd_pin below fixes that.
+	 * Card detect is PH17.  This was PH18 until 2026-08-28, taken from the
+	 * sys_config.fex found in the vendor rootfs - the same file that claims
+	 * machine = "cubieboard4" and is wrong about USB, WiFi and the A15 rail
+	 * (see 33-REAL-PINMAP.md).  The board's own script.bin has
+	 * sdc_det = port:PH17<6><1><2><default>, and PH18 is spdif_dout.
 	 *
-	 * With the pull-up enabled the line still does not go low when a card
-	 * is inserted, so the detect switch itself is not reaching PH18 on
-	 * this board.  broken-cd makes the driver poll instead, which does not
-	 * depend on that switch.  cd-gpios is deliberately dropped - it and
-	 * broken-cd are mutually exclusive.
+	 * That also explains the note this comment used to carry: with a
+	 * pull-up on PH18 the line never went low on insertion, and the
+	 * conclusion drawn was that the detect switch did not reach the pin.
+	 * It does not - because the switch is on PH17.
+	 *
+	 * broken-cd is kept for now: polling is known to work, and nobody has
+	 * yet inserted and removed a card while watching PH17.  Once someone
+	 * has, this should become cd-gpios and broken-cd should go.
 	 */
 	broken-cd;
 	/*
@@ -410,7 +431,7 @@
 	 * the line floated LOW and the driver saw a card permanently present.
 	 */
 	mmc0_cd_pin: mmc0-cd-pin {
-		pins = "PH18";
+		pins = "PH17";
 		function = "gpio_in";
 		bias-pull-up;
 	};
@@ -671,4 +692,15 @@
 		device-wakeup-gpios = <&r_pio 1 4 GPIO_ACTIVE_HIGH>; /* PM04 */
 		host-wakeup-gpios = <&r_pio 1 2 GPIO_ACTIVE_HIGH>;   /* PM02 */
 	};
+};
+
+/*
+ * S/PDIF out on PH18. The board's script.bin has spdif_used = 1 with
+ * spdif_dout = PH18 function 3 and no spdif_din, so this is transmit
+ * only. Whether the Telos actually fits the connector is unconfirmed.
+ */
+&spdif {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spdif_pins>;
+	status = "okay";
 };
