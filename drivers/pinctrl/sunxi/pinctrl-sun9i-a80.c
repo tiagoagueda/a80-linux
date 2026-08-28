@@ -701,6 +701,13 @@ static const struct sunxi_desc_pin sun9i_a80_pins[] = {
 		  SUNXI_FUNCTION(0x0, "gpio_in"),
 		  SUNXI_FUNCTION(0x1, "gpio_out"),
 		  SUNXI_FUNCTION(0x2, "spi3"),		/* CS1 */
+		  /*
+		   * Function 3 is "Reserved" in the public A80 manual, which
+		   * documents no S/PDIF block at all. The Draco AW80's own
+		   * script.bin asks for PH18 function 3 as spdif_dout, and
+		   * the BSP builds its S/PDIF driver for sun9i.
+		   */
+		  SUNXI_FUNCTION(0x3, "spdif"),		/* DOUT */
 		  SUNXI_FUNCTION_IRQ_BANK(0x6, 4, 18)),	/* PH_EINT18 */
 	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 19),
 		  SUNXI_FUNCTION(0x0, "gpio_in"),
