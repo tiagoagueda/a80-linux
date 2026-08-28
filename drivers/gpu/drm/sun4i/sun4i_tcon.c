@@ -1529,15 +1529,25 @@ static const struct sun4i_tcon_quirks sun8i_v3s_quirks = {
 	.dclk_min_div		= 1,
 };
 
+/*
+ * The A80 has three display engines and two TCONs, so like the A31 it
+ * needs to be told which engine feeds which TCON. TCON1_CTL bits 1:0 are
+ * TCON1_Src_Sel - 00: DE 0, 01: DE 1, 1x: blue - and they come out of
+ * reset selecting DE 0. The HDMI pipeline on this SoC is
+ * be1 -> drc1 -> tcon1, i.e. DE 1, so without this the TCON scans out a
+ * display engine nobody is driving and the screen is noise.
+ */
 static const struct sun4i_tcon_quirks sun9i_a80_tcon_lcd_quirks = {
 	.has_channel_0		= true,
 	.needs_edp_reset	= true,
+	.needs_de_be_mux	= true,
 	.dclk_min_div		= 1,
 };
 
 static const struct sun4i_tcon_quirks sun9i_a80_tcon_tv_quirks = {
 	.has_channel_1	= true,
 	.needs_edp_reset = true,
+	.needs_de_be_mux = true,
 };
 
 static const struct sun4i_tcon_quirks sun20i_d1_lcd_quirks = {
