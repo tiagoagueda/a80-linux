@@ -55,9 +55,9 @@
 	};
 
 	/*
-	 * HDMI audio.  mclk-fs = 128 is the vendor's over_sample_rate; no
-	 * master is named, so simple-card leaves the I2S as bitclock and
-	 * frame master, which is what feeds the controller's I2S input.
+	 * HDMI audio.  No master is named, so simple-card leaves the I2S as
+	 * bitclock and frame master, which is what feeds the transmitter's
+	 * I2S input.  The slot width is pinned on the cpu node - see there.
 	 */
 	sound-hdmi {
 		compatible = "simple-audio-card";
@@ -67,6 +67,17 @@
 
 		simple-audio-card,cpu {
 			sound-dai = <&i2s1>;
+			/*
+			 * dw_hdmi_i2s_hw_params() hardcodes
+			 * HDMI_AUD_INPUTCLKFS_64FS, so the transmitter always
+			 * expects its reference at 64 fs and ignores mclk-fs.
+			 * sun4i-i2s otherwise takes the slot width from the
+			 * sample format, and S16_LE would give 2 x 16 x fs =
+			 * 32 fs - half of what the transmitter is counting -
+			 * so pin the slots and 16-bit playback stays silent.
+			 */
+			dai-tdm-slot-num = <2>;
+			dai-tdm-slot-width = <32>;
 		};
 
 		simple-audio-card,codec {
