@@ -417,6 +417,15 @@
 			};
 		};
 
+		dma: dma-controller@802000 {
+			compatible = "allwinner,sun9i-a80-dma";
+			reg = <0x00802000 0x1000>;
+			interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_BUS_DMA>;
+			resets = <&ccu RST_BUS_DMA>;
+			#dma-cells = <1>;
+		};
+
 		gmac: ethernet@830000 {
 			compatible = "allwinner,sun7i-a20-gmac";
 			reg = <0x00830000 0x1054>;
@@ -1184,6 +1193,11 @@
 				function = "uart0";
 			};
 
+			spdif_pins: spdif-pins {
+				pins = "PH18";
+				function = "spdif";
+			};
+
 			uart2_pins: uart2-pins {
 				pins = "PG6", "PG7";
 				function = "uart2";
@@ -1197,6 +1211,19 @@
 				pins = "PG12", "PG13", "PG14", "PG15";
 				function = "uart4";
 			};
+		};
+
+		spdif: spdif@6001000 {
+			#sound-dai-cells = <0>;
+			compatible = "allwinner,sun9i-a80-spdif";
+			reg = <0x06001000 0x400>;
+			interrupts = <GIC_SPI 12 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_BUS_SPDIF>, <&ccu CLK_SPDIF>;
+			clock-names = "apb", "spdif";
+			resets = <&ccu RST_BUS_SPDIF>;
+			dmas = <&dma 2>;
+			dma-names = "tx";
+			status = "disabled";
 		};
 
 		uart0: serial@7000000 {
