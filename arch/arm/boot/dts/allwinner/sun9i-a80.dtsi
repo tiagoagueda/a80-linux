@@ -1103,6 +1103,7 @@
 		 * PHY's and HDMI1 the controller's, split exactly as on the A83T.
 		 */
 		hdmi: hdmi@3d00000 {
+			#sound-dai-cells = <0>;
 			compatible = "allwinner,sun8i-a83t-dw-hdmi";
 			reg = <0x03d00000 0x10000>;
 			reg-io-width = <1>;
@@ -1288,6 +1289,34 @@
 				pins = "PG12", "PG13", "PG14", "PG15";
 				function = "uart4";
 			};
+		};
+
+		/*
+		 * DAUDIO1.  The HDMI controller has no audio DMA of its own -
+		 * CONFIG3_ID reads 0x00, so neither AHBAUDDMA nor GPAUD, only the
+		 * I2S input that CONFIG0_ID bit 4 reports.  The vendor feeds that
+		 * input from this block and nothing else: sunxi-hdmiaudio.c on
+		 * sun9i uses SUNXI_I2S1BASE = 0x06002400 with DRQ 4, and writes no
+		 * routing register anywhere, so the link is internal and fixed.
+		 *
+		 * The register file is the A83T's, but the block is transmit only -
+		 * sun9i is the one SoC for which the BSP does not define
+		 * DRQSRC_DAUDIO_1_RX - so it needs its own variant in sun4i-i2s.
+		 *
+		 * DAUDIO0 at 0x06002000 is left out: it exists, but nothing on this
+		 * board is known to be wired to it.
+		 */
+		i2s1: i2s@6002400 {
+			#sound-dai-cells = <0>;
+			compatible = "allwinner,sun9i-a80-i2s";
+			reg = <0x06002400 0x400>;
+			interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_BUS_I2S1>, <&ccu CLK_I2S1>;
+			clock-names = "apb", "mod";
+			resets = <&ccu RST_BUS_I2S1>;
+			dmas = <&dma 4>;
+			dma-names = "tx";
+			status = "disabled";
 		};
 
 		spdif: spdif@6001000 {

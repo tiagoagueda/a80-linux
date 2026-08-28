@@ -54,6 +54,26 @@
 		};
 	};
 
+	/*
+	 * HDMI audio.  mclk-fs = 128 is the vendor's over_sample_rate; no
+	 * master is named, so simple-card leaves the I2S as bitclock and
+	 * frame master, which is what feeds the controller's I2S input.
+	 */
+	sound-hdmi {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "Draco HDMI";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <128>;
+
+		simple-audio-card,cpu {
+			sound-dai = <&i2s1>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&hdmi>;
+		};
+	};
+
 	reserved-memory {
 		/* must match the root node, which is <2>/<2> on sun9i */
 		#address-cells = <2>;
@@ -721,6 +741,10 @@
  * so HDMI hangs off screen 1 - tcon1 / tcon-tv - not screen 0.
  */
 &de {
+	status = "okay";
+};
+
+&i2s1 {
 	status = "okay";
 };
 
