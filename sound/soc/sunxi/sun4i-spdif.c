@@ -561,6 +561,20 @@ static const struct sun4i_spdif_quirks sun6i_a31_spdif_quirks = {
 	.mclk_multiplier = 1,
 };
 
+/*
+ * The A80's S/PDIF block is undocumented in the public manual, but the
+ * BSP groups it with the A83T and H3 for every register-layout
+ * difference: TX FIFO at 0x20, and bit 31 of FCTL is HUBEN rather than
+ * FIFOSRC. Unlike the H3 the BSP drives the module clock at 24.576 MHz
+ * directly, so the multiplier is 1.
+ */
+static const struct sun4i_spdif_quirks sun9i_a80_spdif_quirks = {
+	.reg_dac_txdata	= SUN8I_SPDIF_TXFIFO,
+	.val_fctl_ftx   = SUN4I_SPDIF_FCTL_FTX,
+	.has_reset	= true,
+	.mclk_multiplier = 1,
+};
+
 static const struct sun4i_spdif_quirks sun8i_h3_spdif_quirks = {
 	.reg_dac_txdata	= SUN8I_SPDIF_TXFIFO,
 	.val_fctl_ftx   = SUN4I_SPDIF_FCTL_FTX,
@@ -595,6 +609,10 @@ static const struct of_device_id sun4i_spdif_of_match[] = {
 	{
 		.compatible = "allwinner,sun8i-h3-spdif",
 		.data = &sun8i_h3_spdif_quirks,
+	},
+	{
+		.compatible = "allwinner,sun9i-a80-spdif",
+		.data = &sun9i_a80_spdif_quirks,
 	},
 	{
 		.compatible = "allwinner,sun50i-h6-spdif",
