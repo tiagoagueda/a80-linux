@@ -373,7 +373,26 @@ static int sunxi_arisc_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, ar);
-	schedule_delayed_work(&ar->fw_work, msecs_to_jiffies(1000));
+
+	/*
+	 * Do not start the coprocessor the moment its firmware is reachable.
+	 *
+	 * Started at around 3.8 s of boot - which is what happens as soon as
+	 * the blob is put in an initramfs instead of on the rootfs - it
+	 * completes its handshake, answers one voltage query correctly, and
+	 * then reports 0 mV for EVERY rail for the rest of the session. The
+	 * CPU-B rail can no longer be read or set, so the A15 cluster comes
+	 * up at whatever c1cpux was left at (408 MHz) instead of its 1.8 GHz
+	 * operating point, and nothing in any return code says so.
+	 *
+	 * Started ~600 ms later it works and keeps working for hours. The
+	 * boot ordering of the RSB bus and the AXP806 is identical either
+	 * way, so what it races with is not yet identified - see
+	 * 45-a15-cluster-solved.md. Until it is, keep the start point where
+	 * it is known good rather than as early as possible; nothing needs
+	 * the coprocessor before userspace anyway.
+	 */
+	schedule_delayed_work(&ar->fw_work, msecs_to_jiffies(3000));
 	return 0;
 }
 
