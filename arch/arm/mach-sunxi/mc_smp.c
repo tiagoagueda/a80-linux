@@ -412,6 +412,9 @@ static const struct sunxi_arisc_vf sun9i_a15_vf[] = {
 #define SUN9I_A15_BOOT_KHZ	1800000
 #define SUN9I_A15_BOOT_MV	1100
 #define SUN9I_A15_VOLT_TYPE	29	/* external CPU-B DC-DC */
+/* the rail's real limits, from sweeping the AR100's own voltage codes */
+#define SUN9I_A15_VOLT_MIN	840
+#define SUN9I_A15_VOLT_MAX	1200
 
 /*
  * a15_pwr_en is PL02 on this board. The AR100 drives the three vset lines
@@ -488,7 +491,25 @@ static int sun9i_a15_cluster_power_on(void)
 	 * The rail comes out of reset at 1200 mV, so asking for a lower
 	 * operating point without this fails before anything is powered.
 	 */
+	/*
+	 * Read the rail back before trusting anything the coprocessor says.
+	 * Asked too soon after it comes up, its DVFS service answers 0 mV to
+	 * every CPU-B voltage query, and then ACCEPTS the power-on request
+	 * without raising PLL_C1: the cluster comes online at whatever
+	 * c1cpux was left at (408 MHz), reports success, and benchmarks
+	 * slower than an A7. Nothing in the return codes says so.
+	 *
+	 * An implausible reading is the one signal available that the
+	 * coprocessor is not settled, so treat it as "not ready yet" and let
+	 * the caller retry rather than bringing the cluster up crippled.
+	 */
 	ret = sunxi_arisc_get_volt(SUN9I_A15_VOLT_TYPE);
+	if (ret < SUN9I_A15_VOLT_MIN || ret > SUN9I_A15_VOLT_MAX) {
+		pr_info("sunxi mc_smp: A15 rail reads %d mV, coprocessor not settled yet\n",
+			ret);
+		return -EAGAIN;
+	}
+
 	pr_info("sunxi mc_smp: A15 rail at %d mV, target %d mV\n",
 		ret, SUN9I_A15_BOOT_MV);
 	if (ret != SUN9I_A15_BOOT_MV) {
@@ -497,8 +518,15 @@ static int sun9i_a15_cluster_power_on(void)
 			pr_err("sunxi mc_smp: A15 rail preset failed: %d\n", ret);
 			return ret;
 		}
-		pr_info("sunxi mc_smp: A15 rail now %d mV\n",
-			sunxi_arisc_get_volt(SUN9I_A15_VOLT_TYPE));
+
+		/* and read it back: a write that reports success is not a write */
+		ret = sunxi_arisc_get_volt(SUN9I_A15_VOLT_TYPE);
+		if (ret != SUN9I_A15_BOOT_MV) {
+			pr_info("sunxi mc_smp: A15 rail went to %d mV, wanted %d; retrying\n",
+				ret, SUN9I_A15_BOOT_MV);
+			return -EAGAIN;
+		}
+		pr_info("sunxi mc_smp: A15 rail now %d mV\n", ret);
 	}
 	/* pll2 selects cluster 1; freq is in kHz */
 	ret = sunxi_arisc_dvfs_set_cpufreq(SUN9I_A15_BOOT_KHZ, 2);
