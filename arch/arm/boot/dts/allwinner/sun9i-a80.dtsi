@@ -1070,8 +1070,80 @@
 
 				tcon1_out: port@1 {
 					reg = <1>;
+
+					tcon1_out_hdmi: endpoint {
+						remote-endpoint = <&hdmi_in_tcon1>;
+					};
 				};
 			};
+		};
+
+		/*
+		 * The A80's HDMI is a Synopsys DesignWare HDMI TX paired with an
+		 * Allwinner vendor PHY - the same arrangement as the A83T, not the
+		 * Allwinner-native controller the A10/A31 use. Read off the block
+		 * itself, one byte at a time:
+		 *
+		 *   +000 = 13  DESIGN_ID     +002 = a0  PRODUCT_ID0
+		 *   +001 = 2a  REVISION_ID   +003 = c1  PRODUCT_ID1
+		 *   +006 = fe  CONFIG2_ID -> DW_HDMI_PHY_VENDOR_PHY
+		 *
+		 * 0xa0/0xc1 is the DesignWare signature and the register file is
+		 * byte-wide, hence reg-io-width = <1>: a 32-bit read returns the
+		 * same byte on all four lanes (0x13131313 at +000).
+		 *
+		 * The public A80 manual documents none of this - it has no HDMI
+		 * chapter at all. The address is from the vendor U-Boot
+		 * (REGS_AHB2_BASE + 0xd00000, AHB2 = 0x03000000), cross-checked
+		 * against LCD0 and DE_BE0; the interrupt is from the vendor IRQ
+		 * table, which maps 1:1 onto GIC SPI numbers. Both were confirmed
+		 * by reading the block on hardware.
+		 *
+		 * The CCU having two HDMI resets is itself a tell: HDMI0 is the
+		 * PHY's and HDMI1 the controller's, split exactly as on the A83T.
+		 */
+		hdmi: hdmi@3d00000 {
+			compatible = "allwinner,sun8i-a83t-dw-hdmi";
+			reg = <0x03d00000 0x10000>;
+			reg-io-width = <1>;
+			interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ccu CLK_BUS_HDMI>, <&ccu CLK_HDMI_SLOW>,
+				 <&ccu CLK_HDMI>;
+			clock-names = "iahb", "isfr", "tmds";
+			resets = <&ccu RST_BUS_HDMI1>;
+			reset-names = "ctrl";
+			phys = <&hdmi_phy>;
+			phy-names = "phy";
+			pinctrl-names = "default";
+			pinctrl-0 = <&hdmi_pins>;
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				hdmi_in: port@0 {
+					reg = <0>;
+
+					hdmi_in_tcon1: endpoint {
+						remote-endpoint = <&tcon1_out_hdmi>;
+					};
+				};
+
+				hdmi_out: port@1 {
+					reg = <1>;
+				};
+			};
+		};
+
+		hdmi_phy: hdmi-phy@3d10000 {
+			compatible = "allwinner,sun8i-a83t-hdmi-phy";
+			reg = <0x03d10000 0x10000>;
+			clocks = <&ccu CLK_BUS_HDMI>, <&ccu CLK_HDMI_SLOW>;
+			clock-names = "bus", "mod";
+			resets = <&ccu RST_BUS_HDMI0>;
+			reset-names = "phy";
+			#phy-cells = <0>;
 		};
 
 		ths: thermal-sensor@6004c00 {
@@ -1191,6 +1263,11 @@
 			uart0_ph_pins: uart0-ph-pins {
 				pins = "PH12", "PH13";
 				function = "uart0";
+			};
+
+			hdmi_pins: hdmi-pins {
+				pins = "PH19", "PH20", "PH21";
+				function = "hdmi";
 			};
 
 			spdif_pins: spdif-pins {
