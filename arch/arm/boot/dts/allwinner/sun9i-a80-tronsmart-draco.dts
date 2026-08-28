@@ -704,3 +704,29 @@
 	pinctrl-0 = <&spdif_pins>;
 	status = "okay";
 };
+
+/*
+ * Display.  [hdmi_para] has hdmi_used = 1, and the vendor bootloader
+ * probes HDMI before falling back to the GM7121 composite encoder:
+ *
+ *   screen_id 0 do not support HDMI TYPE!
+ *   boot_disp.auto_hpd=1 / auto hpd check has 100 times!
+ *   auto check no any connected, the output_type is 2
+ *   [TV]gm7121_tv_power_on
+ *
+ * so HDMI hangs off screen 1 - tcon1 / tcon-tv - not screen 0.
+ */
+&de {
+	status = "okay";
+};
+
+&hdmi {
+	/*
+	 * First attempt drove this with sun4i_hdmi, on the strength of the
+	 * vendor U-Boot's DDC code matching the A31 register layout. That was
+	 * wrong: the block is a DesignWare TX, and writing A31-style 32-bit
+	 * registers into a byte-wide register file wedged the SoC dead at
+	 * 1.15 s, before any watchdog was armed. See 44-hdmi.md.
+	 */
+	status = "okay";
+};
