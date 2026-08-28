@@ -409,8 +409,30 @@ static const struct sunxi_arisc_vf sun9i_a15_vf[] = {
 	{ 1200000000,  900 },
 };
 
-#define SUN9I_A15_BOOT_KHZ	1800000
-#define SUN9I_A15_BOOT_MV	1100
+/*
+ * The vendor's table goes up to 1800 MHz and boot0 caps max_freq there, but
+ * 1800 MHz is not usable on this board: with several A15 cores busy at once it
+ * corrupts memory, silently, at about one bit per 30 MiB. Measured by copying
+ * a 32 MiB buffer inside tmpfs under load and checking it, 15 times per point:
+ *
+ *	1200 MHz /  900 mV	 0/15 corrupt
+ *	1608 MHz / 1000 mV	 0/15 corrupt
+ *	1800 MHz / 1100 mV	15/15 corrupt
+ *	1800 MHz / 1200 mV	14/15 corrupt	<- rail at its maximum
+ *
+ * It is not an under-volt: forcing the rail to the highest code it offers
+ * changes nothing. It is not thermal either - the die peaks at 69 C against a
+ * 95 C trip - and the DRAM clock and impedance were eliminated first, neither
+ * moving the failure rate at all. The frequency itself is real: a fixed
+ * workload runs 1.52x faster at 1800 than at 1200, as it should.
+ *
+ * So the cluster is capped one step down until 1800 MHz is understood. The
+ * vendor gets away with exposing it because it has working cpufreq and thermal
+ * throttling and therefore rarely sustains it on four cores; this port has
+ * neither, so whatever is set here runs permanently.
+ */
+#define SUN9I_A15_BOOT_KHZ	1608000
+#define SUN9I_A15_BOOT_MV	1000
 #define SUN9I_A15_VOLT_TYPE	29	/* external CPU-B DC-DC */
 /* the rail's real limits, from sweeping the AR100's own voltage codes */
 #define SUN9I_A15_VOLT_MIN	840
