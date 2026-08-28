@@ -93,6 +93,19 @@
 #define DMA_CHAN_CUR_PARA	0x1c
 
 /*
+ * A80-only per-channel register. The BSP writes it immediately before
+ * starting a channel; it selects handshake rather than wait mode for the
+ * DRQ response. The BSP names the two fields SRC_HS_MASK (0x1 << 2) and
+ * DST_HS_MASK (0x2 << 3) - note that the second expression yields bit 4,
+ * while its own comment claims bit 3. The value the vendor driver actually
+ * writes, and therefore the one this hardware is known to work with, is
+ * 0x14.
+ */
+#define DMA_CHAN_OP_MODE	0x28
+#define DMA_CHAN_OP_MODE_SRC_HS		BIT(2)
+#define DMA_CHAN_OP_MODE_DST_HS		BIT(4)
+
+/*
  * LLI address mangling
  *
  * The LLI link physical address is also mangled, but we avoid dealing
@@ -105,7 +118,10 @@
  * Various hardware related defines
  */
 #define LLI_LAST_ITEM	0xfffff800
+/* The A80's LLI-next field is narrower, so its end marker differs. */
+#define LLI_LAST_ITEM_A80	0x1ffff800
 #define NORMAL_WAIT	8
+/* DRQ port number of the DRAM endpoint. Not the same on every SoC. */
 #define DRQ_SDRAM	1
 #define LINEAR_MODE     0
 #define IO_MODE         1
@@ -144,6 +160,15 @@ struct sun6i_dma_config {
 	u32 dst_addr_widths;
 	bool has_high_addr;
 	bool has_mbus_clk;
+	/*
+	 * Value the hardware recognises as "end of the descriptor list".
+	 * Zero means the usual LLI_LAST_ITEM.
+	 */
+	u32 lli_last_item;
+	/* Channel needs DMA_CHAN_OP_MODE programmed before it is started. */
+	bool has_op_mode;
+	/* DRQ port of the DRAM endpoint; DRQ_SDRAM everywhere but the A80. */
+	u8 drq_sdram;
 };
 
 /*
@@ -347,7 +372,12 @@ static void sun6i_set_mode_h6(u32 *p_cfg, s8 src_mode, s8 dst_mode)
 		  DMA_CHAN_CFG_DST_MODE_H6(dst_mode);
 }
 
-static size_t sun6i_get_chan_size(struct sun6i_pchan *pchan)
+static u32 sun6i_lli_last(struct sun6i_dma_dev *sdev)
+{
+	return sdev->cfg->lli_last_item ?: LLI_LAST_ITEM;
+}
+
+static size_t sun6i_get_chan_size(struct sun6i_pchan *pchan, u32 lli_last)
 {
 	struct sun6i_desc *txd = pchan->desc;
 	struct sun6i_dma_lli *lli;
@@ -357,7 +387,7 @@ static size_t sun6i_get_chan_size(struct sun6i_pchan *pchan)
 	pos = readl(pchan->base + DMA_CHAN_LLI_ADDR);
 	bytes = readl(pchan->base + DMA_CHAN_CUR_CNT);
 
-	if (pos == LLI_LAST_ITEM)
+	if (pos == lli_last)
 		return bytes;
 
 	for (lli = txd->v_lli; lli; lli = lli->v_lli_next) {
@@ -374,7 +404,8 @@ static size_t sun6i_get_chan_size(struct sun6i_pchan *pchan)
 static void *sun6i_dma_lli_add(struct sun6i_dma_lli *prev,
 			       struct sun6i_dma_lli *next,
 			       dma_addr_t next_phy,
-			       struct sun6i_desc *txd)
+			       struct sun6i_desc *txd,
+			       u32 lli_last)
 {
 	if ((!prev && !txd) || !next)
 		return NULL;
@@ -387,7 +418,7 @@ static void *sun6i_dma_lli_add(struct sun6i_dma_lli *prev,
 		prev->v_lli_next = next;
 	}
 
-	next->p_lli_next = LLI_LAST_ITEM;
+	next->p_lli_next = lli_last;
 	next->v_lli_next = NULL;
 
 	return next;
@@ -465,6 +496,10 @@ static int sun6i_dma_start_desc(struct sun6i_vchan *vchan)
 			(irq_offset * DMA_IRQ_CHAN_WIDTH));
 	irq_val |= vchan->irq_type << (irq_offset * DMA_IRQ_CHAN_WIDTH);
 	writel(irq_val, sdev->base + DMA_IRQ_EN(irq_reg));
+
+	if (sdev->cfg->has_op_mode)
+		writel(DMA_CHAN_OP_MODE_SRC_HS | DMA_CHAN_OP_MODE_DST_HS,
+		       pchan->base + DMA_CHAN_OP_MODE);
 
 	writel(pchan->desc->p_lli, pchan->base + DMA_CHAN_LLI_ADDR);
 	writel(DMA_CHAN_ENABLE_START, pchan->base + DMA_CHAN_ENABLE);
@@ -698,10 +733,11 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_memcpy(
 		DMA_CHAN_CFG_DST_WIDTH(width);
 
 	sdev->cfg->set_burst_length(&v_lli->cfg, burst, burst);
-	sdev->cfg->set_drq(&v_lli->cfg, DRQ_SDRAM, DRQ_SDRAM);
+	sdev->cfg->set_drq(&v_lli->cfg, sdev->cfg->drq_sdram,
+			   sdev->cfg->drq_sdram);
 	sdev->cfg->set_mode(&v_lli->cfg, LINEAR_MODE, LINEAR_MODE);
 
-	sun6i_dma_lli_add(NULL, v_lli, p_lli, txd);
+	sun6i_dma_lli_add(NULL, v_lli, p_lli, txd, sun6i_lli_last(sdev));
 
 	sun6i_dma_dump_lli(vchan, v_lli, p_lli);
 
@@ -753,7 +789,8 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_slave_sg(
 					   sg_dma_address(sg),
 					   sconfig->dst_addr);
 			v_lli->cfg = lli_cfg;
-			sdev->cfg->set_drq(&v_lli->cfg, DRQ_SDRAM, vchan->port);
+			sdev->cfg->set_drq(&v_lli->cfg, sdev->cfg->drq_sdram,
+					   vchan->port);
 			sdev->cfg->set_mode(&v_lli->cfg, LINEAR_MODE, IO_MODE);
 
 			dev_dbg(chan2dev(chan),
@@ -767,7 +804,8 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_slave_sg(
 					   sconfig->src_addr,
 					   sg_dma_address(sg));
 			v_lli->cfg = lli_cfg;
-			sdev->cfg->set_drq(&v_lli->cfg, vchan->port, DRQ_SDRAM);
+			sdev->cfg->set_drq(&v_lli->cfg, vchan->port,
+					   sdev->cfg->drq_sdram);
 			sdev->cfg->set_mode(&v_lli->cfg, IO_MODE, LINEAR_MODE);
 
 			dev_dbg(chan2dev(chan),
@@ -777,7 +815,8 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_slave_sg(
 				sg_dma_len(sg), flags);
 		}
 
-		prev = sun6i_dma_lli_add(prev, v_lli, p_lli, txd);
+		prev = sun6i_dma_lli_add(prev, v_lli, p_lli, txd,
+					 sun6i_lli_last(sdev));
 	}
 
 	dev_dbg(chan2dev(chan), "First: %pad\n", &txd->p_lli);
@@ -838,7 +877,8 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_cyclic(
 					   buf_addr + period_len * i,
 					   sconfig->dst_addr);
 			v_lli->cfg = lli_cfg;
-			sdev->cfg->set_drq(&v_lli->cfg, DRQ_SDRAM, vchan->port);
+			sdev->cfg->set_drq(&v_lli->cfg, sdev->cfg->drq_sdram,
+					   vchan->port);
 			sdev->cfg->set_mode(&v_lli->cfg, LINEAR_MODE, IO_MODE);
 			dev_dbg(chan2dev(chan),
 				"%s; chan: %d, dest: %pad, src: %pad, len: %zu. flags: 0x%08lx\n",
@@ -850,7 +890,8 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_cyclic(
 					   sconfig->src_addr,
 					   buf_addr + period_len * i);
 			v_lli->cfg = lli_cfg;
-			sdev->cfg->set_drq(&v_lli->cfg, vchan->port, DRQ_SDRAM);
+			sdev->cfg->set_drq(&v_lli->cfg, vchan->port,
+					   sdev->cfg->drq_sdram);
 			sdev->cfg->set_mode(&v_lli->cfg, IO_MODE, LINEAR_MODE);
 			dev_dbg(chan2dev(chan),
 				"%s; chan: %d, dest: %pad, src: %pad, len: %zu. flags: 0x%08lx\n",
@@ -859,7 +900,8 @@ static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_cyclic(
 				buf_len, flags);
 		}
 
-		prev = sun6i_dma_lli_add(prev, v_lli, p_lli, txd);
+		prev = sun6i_dma_lli_add(prev, v_lli, p_lli, txd,
+					 sun6i_lli_last(sdev));
 	}
 
 	prev->p_lli_next = txd->p_lli;		/* cyclic list */
@@ -999,7 +1041,8 @@ static enum dma_status sun6i_dma_tx_status(struct dma_chan *chan,
 	} else if (!pchan || !pchan->desc) {
 		bytes = 0;
 	} else {
-		bytes = sun6i_get_chan_size(pchan);
+		bytes = sun6i_get_chan_size(pchan,
+				sun6i_lli_last(to_sun6i_dma_dev(chan->device)));
 	}
 
 	spin_unlock_irqrestore(&vchan->vc.lock, flags);
@@ -1120,6 +1163,7 @@ static struct sun6i_dma_config sun6i_a31_dma_cfg = {
 	.nr_max_vchans   = 53,
 	.set_burst_length = sun6i_set_burst_length_a31,
 	.set_drq          = sun6i_set_drq_a31,
+	.drq_sdram        = DRQ_SDRAM,
 	.set_mode         = sun6i_set_mode_a31,
 	.src_burst_lengths = BIT(1) | BIT(8),
 	.dst_burst_lengths = BIT(1) | BIT(8),
@@ -1143,6 +1187,7 @@ static struct sun6i_dma_config sun8i_a23_dma_cfg = {
 	.clock_autogate_enable = sun6i_enable_clock_autogate_a23,
 	.set_burst_length = sun6i_set_burst_length_a31,
 	.set_drq          = sun6i_set_drq_a31,
+	.drq_sdram        = DRQ_SDRAM,
 	.set_mode         = sun6i_set_mode_a31,
 	.src_burst_lengths = BIT(1) | BIT(8),
 	.dst_burst_lengths = BIT(1) | BIT(8),
@@ -1161,6 +1206,7 @@ static struct sun6i_dma_config sun8i_a83t_dma_cfg = {
 	.clock_autogate_enable = sun6i_enable_clock_autogate_a23,
 	.set_burst_length = sun6i_set_burst_length_a31,
 	.set_drq          = sun6i_set_drq_a31,
+	.drq_sdram        = DRQ_SDRAM,
 	.set_mode         = sun6i_set_mode_a31,
 	.src_burst_lengths = BIT(1) | BIT(8),
 	.dst_burst_lengths = BIT(1) | BIT(8),
@@ -1179,6 +1225,38 @@ static struct sun6i_dma_config sun8i_a83t_dma_cfg = {
  * and the burst length fields have different offsets.
  */
 
+/*
+ * The A80 is an A31-era controller - 16 channels, 30 requests, the A31 DRQ
+ * and mode encoding - but it takes the H3's burst shift and gating register,
+ * and adds two things nothing else has: a narrower LLI-next field and a
+ * per-channel handshake mode register.
+ */
+static struct sun6i_dma_config sun9i_a80_dma_cfg = {
+	.nr_max_channels = 16,
+	.nr_max_requests = 30,
+	.nr_max_vchans   = 53,
+	.clock_autogate_enable = sun6i_enable_clock_autogate_h3,
+	.set_burst_length = sun6i_set_burst_length_h3,
+	.set_drq          = sun6i_set_drq_a31,
+	/*
+	 * The A80 numbers its DRAM endpoint 0, not 1. The BSP's DRQ table
+	 * has DRQSRC_SDRAM = DRQDST_SDRAM = 0, and uses it for memcpy as
+	 * well as for both directions of every slave transfer.
+	 */
+	.drq_sdram        = 0,
+	.set_mode         = sun6i_set_mode_a31,
+	.src_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
+	.dst_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
+	.src_addr_widths   = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+			     BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+			     BIT(DMA_SLAVE_BUSWIDTH_4_BYTES),
+	.dst_addr_widths   = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+			     BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+			     BIT(DMA_SLAVE_BUSWIDTH_4_BYTES),
+	.lli_last_item     = LLI_LAST_ITEM_A80,
+	.has_op_mode       = true,
+};
+
 static struct sun6i_dma_config sun8i_h3_dma_cfg = {
 	.nr_max_channels = 12,
 	.nr_max_requests = 27,
@@ -1186,6 +1264,7 @@ static struct sun6i_dma_config sun8i_h3_dma_cfg = {
 	.clock_autogate_enable = sun6i_enable_clock_autogate_h3,
 	.set_burst_length = sun6i_set_burst_length_h3,
 	.set_drq          = sun6i_set_drq_a31,
+	.drq_sdram        = DRQ_SDRAM,
 	.set_mode         = sun6i_set_mode_a31,
 	.src_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
 	.dst_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
@@ -1207,6 +1286,7 @@ static struct sun6i_dma_config sun50i_a64_dma_cfg = {
 	.clock_autogate_enable = sun6i_enable_clock_autogate_h3,
 	.set_burst_length = sun6i_set_burst_length_h3,
 	.set_drq          = sun6i_set_drq_a31,
+	.drq_sdram        = DRQ_SDRAM,
 	.set_mode         = sun6i_set_mode_a31,
 	.src_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
 	.dst_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
@@ -1228,6 +1308,7 @@ static struct sun6i_dma_config sun50i_a100_dma_cfg = {
 	.clock_autogate_enable = sun6i_enable_clock_autogate_h3,
 	.set_burst_length = sun6i_set_burst_length_h3,
 	.set_drq          = sun6i_set_drq_h6,
+	.drq_sdram        = DRQ_SDRAM,
 	.set_mode         = sun6i_set_mode_h6,
 	.src_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
 	.dst_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
@@ -1251,6 +1332,7 @@ static struct sun6i_dma_config sun50i_h6_dma_cfg = {
 	.clock_autogate_enable = sun6i_enable_clock_autogate_h3,
 	.set_burst_length = sun6i_set_burst_length_h3,
 	.set_drq          = sun6i_set_drq_h6,
+	.drq_sdram        = DRQ_SDRAM,
 	.set_mode         = sun6i_set_mode_h6,
 	.src_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
 	.dst_burst_lengths = BIT(1) | BIT(4) | BIT(8) | BIT(16),
@@ -1277,6 +1359,7 @@ static struct sun6i_dma_config sun8i_v3s_dma_cfg = {
 	.clock_autogate_enable = sun6i_enable_clock_autogate_a23,
 	.set_burst_length = sun6i_set_burst_length_a31,
 	.set_drq          = sun6i_set_drq_a31,
+	.drq_sdram        = DRQ_SDRAM,
 	.set_mode         = sun6i_set_mode_a31,
 	.src_burst_lengths = BIT(1) | BIT(8),
 	.dst_burst_lengths = BIT(1) | BIT(8),
@@ -1293,6 +1376,7 @@ static const struct of_device_id sun6i_dma_match[] = {
 	{ .compatible = "allwinner,sun8i-a23-dma", .data = &sun8i_a23_dma_cfg },
 	{ .compatible = "allwinner,sun8i-a83t-dma", .data = &sun8i_a83t_dma_cfg },
 	{ .compatible = "allwinner,sun8i-h3-dma", .data = &sun8i_h3_dma_cfg },
+	{ .compatible = "allwinner,sun9i-a80-dma", .data = &sun9i_a80_dma_cfg },
 	{ .compatible = "allwinner,sun8i-v3s-dma", .data = &sun8i_v3s_dma_cfg },
 	{ .compatible = "allwinner,sun20i-d1-dma", .data = &sun50i_a100_dma_cfg },
 	{ .compatible = "allwinner,sun50i-a64-dma", .data = &sun50i_a64_dma_cfg },
