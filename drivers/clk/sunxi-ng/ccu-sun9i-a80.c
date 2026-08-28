@@ -63,33 +63,62 @@ static struct ccu_mult pll_c1cpux_clk = {
 };
 
 /*
- * The Audio PLL has d1, d2 dividers in addition to the usual N, M
- * factors. Since we only need 2 frequencies from this PLL: 22.5792 MHz
- * and 24.576 MHz, ignore them for now. Enforce d1 = 0 and d2 = 0.
+ * The Audio PLL is 24 MHz * N / (d1 + 1) / (d2 + 1) / (P + 1), per the A80
+ * manual (3.3.5.3, PLL_AUDIO_CTRL_REG).  The driver's "M" is that P, and it is
+ * a plain "+1" divider like every other one in this CCU.  It used to be
+ * modelled with a zero offset, which made every audio clock on the SoC
+ * 1/(1 + 1/M) too slow while reading back as exactly correct: asked for
+ * 122.88 MHz the framework wrote M = 25 and the hardware produced
+ * 24 MHz * 128 / 26 = 118.15 MHz.  A zero offset also let M = 0 ask for a
+ * division by zero.
  *
- * M is a plain "+1" divider like every other one in this CCU. It was modelled
- * with a zero offset, which made every audio clock on the SoC 1/(1 + 1/M) too
- * slow while reading back as exactly correct: asked for 122.88 MHz the
- * framework wrote M = 25 and the hardware produced 24 MHz * 128 / 26 =
- * 118.15 MHz. Measured on a Tronsmart Draco AW80 Telos by timing playback of
- * a buffer of known length - 60 s of 48 kHz took 62.564 s, a factor of exactly
- * 26/25 - and independently by the HDMI transmitter's own automatic CTS
- * counter, which read 154440 where 1080p60 wants 148500, the same 1.04. With
- * the offset corrected both land on the nose: 60.157 s and 148500.
+ * d1 and d2 are left at 0 and are not modelled.  They were once suspected of
+ * causing the 44.1 kHz fault below; reading the register during playback ruled
+ * that out - both are 0, exactly as this comment always claimed.
  *
- * A zero offset also lets M = 0 ask for a division by zero.
+ * The real constraint is one the integer search cannot express: P is a *post*
+ * divider, so the VCO runs at 24 MHz * N regardless of it, and this part's VCO
+ * saturates at about 3.14 GHz (the manual specifies these PLLs to 3 GHz).
+ * ccu_nm_find_best() has no VCO bound and would pick N = 143 for the 44.1 kHz
+ * family, asking for 3.432 GHz and getting 3.14, which came out as audio 9.5%
+ * slow with every register reading back correct.  min_rate/max_rate cannot fix
+ * this: they clamp the output rate, and the output rate was never wrong.
+ *
+ * Sigma-delta modulation is the fix, and is what the hardware is for.  No
+ * integer N/P can produce the 44.1 kHz family at all - 22.5792/24 is 588/625
+ * in lowest terms, so an exact solution needs P + 1 to be a multiple of 625
+ * and P + 1 <= 64.  The two patterns below come from the vendor BSP
+ * (get_factors_pll3() in clk-sun9iw1.c), which drives this PLL to exactly two
+ * rates and refuses every other one; ccu-sun8i-a83t.c carries the same two
+ * words.  They put the VCO at 1.30 and 1.47 GHz, less than half the ceiling,
+ * and both rates come out exact rather than approximated.
+ *
+ * The vendor reaches 22.5792/24.576 MHz with d2 = 1; the rates here are twice
+ * that because d2 stays 0, which is what the i2s and spdif dividers want.
+ *
+ * Measured on a Tronsmart Draco AW80 Telos by timing playback of a buffer of
+ * known length, and by sweeping N at a constant N/(P+1) to separate the VCO
+ * from everything downstream of it.
  */
 #define SUN9I_A80_PLL_AUDIO_REG	0x008
+
+static struct ccu_sdm_setting pll_audio_sdm_table[] = {
+	{ .rate = 45158400, .pattern = 0xc00121ff, .m = 29, .n = 54 },
+	{ .rate = 49152000, .pattern = 0xc000e147, .m = 30, .n = 61 },
+};
 
 static struct ccu_nm pll_audio_clk = {
 	.enable		= BIT(31),
 	.lock		= BIT(2),
 	.n		= _SUNXI_CCU_MULT_OFFSET_MIN_MAX(8, 8, 0, 12, 0),
 	.m		= _SUNXI_CCU_DIV(0, 6),
+	.sdm		= _SUNXI_CCU_SDM(pll_audio_sdm_table, BIT(24),
+					 0x108, BIT(31)),
 	.common		= {
 		.reg		= 0x008,
 		.lock_reg	= CCU_SUN9I_LOCK_REG,
-		.features	= CCU_FEATURE_LOCK_REG,
+		.features	= CCU_FEATURE_LOCK_REG |
+				  CCU_FEATURE_SIGMA_DELTA_MOD,
 		.hw.init	= CLK_HW_INIT("pll-audio", "osc24M",
 					      &ccu_nm_ops, CLK_SET_RATE_UNGATE),
 	},
