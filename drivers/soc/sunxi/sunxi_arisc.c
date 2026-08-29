@@ -70,6 +70,25 @@
 #define ARISC_BEACON_TIMEOUT_MS	2000
 #define ARISC_XACT_TIMEOUT_MS	3000
 
+/*
+ * How long after the handshake to re-check the voltage service, and how many
+ * times to restart the firmware if it is dead. One second is comfortably past
+ * the point where the failure shows: the service answers the FIRST query
+ * correctly and returns 0 mV from roughly a second later.
+ */
+#define ARISC_VOLT_SETTLE_MS	1000
+#define ARISC_START_ATTEMPTS	3
+
+/* Plausible rail window. The rails asked about here sit at 600-1200 mV; a dead
+ * service answers 0 for every type, which is what makes it detectable at all. */
+#define ARISC_VOLT_MIN_MV	300
+#define ARISC_VOLT_MAX_MV	1600
+
+static unsigned int start_delay_ms = 3000;
+module_param(start_delay_ms, uint, 0444);
+MODULE_PARM_DESC(start_delay_ms,
+	"delay before starting the coprocessor (default 3000; see #47)");
+
 static const int arisc_rx_ch[] = { 0, 2, 5 };
 
 struct sunxi_arisc {
@@ -320,6 +339,65 @@ static int sunxi_arisc_start(struct sunxi_arisc *ar, const struct firmware *fw)
 	return 0;
 }
 
+static bool arisc_volt_plausible(int mv)
+{
+	return mv >= ARISC_VOLT_MIN_MV && mv <= ARISC_VOLT_MAX_MV;
+}
+
+/*
+ * Start the coprocessor and then prove its voltage service is actually alive.
+ *
+ * A start can look perfect and still be useless: the beacon arrives, the
+ * loopback passes, the first voltage query answers correctly, and every query
+ * from about a second later returns 0 mV for every rail type. Nothing returns
+ * an error. mc_smp then powers the A15 cluster without being able to raise
+ * PLL_C1, and the big core comes up at 408 MHz - slower than an A7 - with
+ * every return code reporting success. It was originally caught by
+ * benchmarking, not by reading the log.
+ *
+ * The race itself is still unidentified (#47). What does not require
+ * understanding it is noticing, because the symptom is unambiguous, and
+ * restarting the firmware - which is the same reset/load/release/handshake
+ * this function already performs.
+ *
+ * If every attempt fails the coprocessor is deliberately left not-ready, so
+ * sunxi_arisc_get_volt() returns -EAGAIN and mc_smp refuses to bring the
+ * cluster up at all. Four good cores beat eight bad ones.
+ */
+static int sunxi_arisc_start_verified(struct sunxi_arisc *ar,
+				      const struct firmware *fw)
+{
+	int attempt, mv, ret;
+
+	for (attempt = 1; attempt <= ARISC_START_ATTEMPTS; attempt++) {
+		ret = sunxi_arisc_start(ar, fw);
+		if (ret)
+			return ret;
+
+		msleep(ARISC_VOLT_SETTLE_MS);
+
+		mv = sunxi_arisc_get_volt(ARISC_VOLT_TYPE_OZ80120);
+		if (arisc_volt_plausible(mv)) {
+			if (attempt > 1)
+				dev_info(ar->dev,
+					 "voltage service healthy after %d starts (CPUB %d mV)\n",
+					 attempt, mv);
+			return 0;
+		}
+
+		dev_warn(ar->dev,
+			 "voltage service dead after start %d (CPUB reads %d mV); restarting firmware\n",
+			 attempt, mv);
+		ar->ready = false;
+		arisc = NULL;
+	}
+
+	dev_err(ar->dev,
+		"voltage service still dead after %d starts; leaving the coprocessor down so the A15 is refused rather than crippled\n",
+		ARISC_START_ATTEMPTS);
+	return -EIO;
+}
+
 /*
  * The coprocessor is not needed until userspace asks for a CPU or a
  * frequency, and its firmware lives on the rootfs, which is not mounted
@@ -343,7 +421,7 @@ static void sunxi_arisc_fw_work(struct work_struct *work)
 		return;
 	}
 
-	ret = sunxi_arisc_start(ar, fw);
+	ret = sunxi_arisc_start_verified(ar, fw);
 	release_firmware(fw);
 	if (ret)
 		return;
@@ -391,8 +469,14 @@ static int sunxi_arisc_probe(struct platform_device *pdev)
 	 * 45-a15-cluster-solved.md. Until it is, keep the start point where
 	 * it is known good rather than as early as possible; nothing needs
 	 * the coprocessor before userspace anyway.
+	 *
+	 * Since 2026-08-29 this delay is a preference rather than a dependency:
+	 * sunxi_arisc_start_verified() re-reads the CPU-B rail a second after the
+	 * handshake and restarts the firmware if the service is dead, so crossing
+	 * the race is recoverable instead of silent. start_delay_ms exists to make
+	 * the failure reproducible on demand - set it low and watch the restart.
 	 */
-	schedule_delayed_work(&ar->fw_work, msecs_to_jiffies(3000));
+	schedule_delayed_work(&ar->fw_work, msecs_to_jiffies(start_delay_ms));
 	return 0;
 }
 
